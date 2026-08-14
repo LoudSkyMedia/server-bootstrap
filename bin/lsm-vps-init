@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SOURCE_PATH="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  RESOLVED_SOURCE="$(readlink -f "$SOURCE_PATH" 2>/dev/null || true)"
+  if [[ -n "$RESOLVED_SOURCE" ]]; then
+    SOURCE_PATH="$RESOLVED_SOURCE"
+  fi
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
+SOURCE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DEFAULT_INSTALLED_ROOT="/usr/local/lib/lsm-vps-init"
 TMUX_SESSION="${LSM_VPS_INIT_TMUX_SESSION:-lsm-vps-init}"
 
 filtered_args=()
@@ -34,5 +43,20 @@ if [[ "$no_tmux" -eq 0 && "$skip_tmux" -eq 0 && -z "${TMUX:-}" && -t 0 && -t 1 ]
   fi
 fi
 
-export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+APP_ROOT="${LSM_VPS_INIT_APP_ROOT:-}"
+if [[ -z "$APP_ROOT" ]]; then
+  if [[ -f "$SOURCE_ROOT/lsm_vps_init/__init__.py" ]]; then
+    APP_ROOT="$SOURCE_ROOT"
+  elif [[ -f "$DEFAULT_INSTALLED_ROOT/lsm_vps_init/__init__.py" ]]; then
+    APP_ROOT="$DEFAULT_INSTALLED_ROOT"
+  else
+    printf 'ERROR: cannot find lsm_vps_init Python package. Checked %s and %s.\n' "$SOURCE_ROOT" "$DEFAULT_INSTALLED_ROOT" >&2
+    exit 127
+  fi
+elif [[ ! -f "$APP_ROOT/lsm_vps_init/__init__.py" ]]; then
+  printf 'ERROR: LSM_VPS_INIT_APP_ROOT does not contain lsm_vps_init Python package: %s\n' "$APP_ROOT" >&2
+  exit 127
+fi
+
+export PYTHONPATH="$APP_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 exec python3 -m lsm_vps_init.cli "${filtered_args[@]}"
