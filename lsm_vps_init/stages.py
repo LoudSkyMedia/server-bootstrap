@@ -435,6 +435,28 @@ def ufw_status_allows(status_text: str, port: str) -> bool:
     return bool(re.search(rf"(?m)^\s*{re.escape(port)}\s+ALLOW\b", status_text))
 
 
+def ufw_show_added_allows(added_text: str, port: str) -> bool:
+    return bool(re.search(rf"(?m)^\s*ufw\s+allow(?:\s+in)?\s+{re.escape(port)}(?:\s*$|\s+)", added_text))
+
+
+def ufw_status_is_active(status_text: str) -> bool:
+    return bool(re.search(r"(?mi)^\s*Status:\s+active\s*$", status_text))
+
+
+def ufw_status_defaults_are_safe(status_text: str) -> bool:
+    return bool(re.search(r"(?mi)^\s*Default:\s*deny\s+\(incoming\),\s*allow\s+\(outgoing\)", status_text))
+
+
+def validate_ufw_phase_a_active_status(status_text: str, ports: list[str]) -> None:
+    if not ufw_status_is_active(status_text):
+        raise Failed("UFW Phase A did not become active after enable.")
+    if not ufw_status_defaults_are_safe(status_text):
+        raise Failed("UFW Phase A default policy is not deny incoming / allow outgoing after enable.")
+    for port in ports:
+        if not ufw_status_allows(status_text, port):
+            raise Failed(f"UFW Phase A did not retain required allow rule after enable: {port}")
+
+
 def codex_reasoning_config_arg(reasoning: str = REQUIRED_CODEX_REASONING) -> str:
     return "model_reasoning_effort=" + json.dumps(reasoning)
 
@@ -806,7 +828,13 @@ def detect_firewall_phase_a(ctx: Context) -> bool:
         return detected_stage_by_state(ctx, "firewall_phase_a")
     result = ctx.runner.run(["ufw", "status", "verbose"], check=False)
     text = result.stdout
-    return result.returncode == 0 and "Status: active" in text and ufw_status_allows(text, "22/tcp") and ufw_status_allows(text, f"{SSH_PORT}/tcp")
+    if result.returncode != 0:
+        return False
+    try:
+        validate_ufw_phase_a_active_status(text, ["22/tcp", f"{SSH_PORT}/tcp"])
+    except Failed:
+        return False
+    return True
 
 
 def run_firewall_phase_a(ctx: Context) -> StageResult:
@@ -821,15 +849,13 @@ def run_firewall_phase_a(ctx: Context) -> StageResult:
         ctx.runner.run(["ufw", "default", "allow", "outgoing"])
         for port in ports:
             ctx.runner.run(["ufw", "allow", port])
-        status = ctx.runner.run(["ufw", "status", "verbose"], check=False).stdout
+        staged = ctx.runner.run(["ufw", "show", "added"], check=False).stdout
         for port in ports:
-            if not ufw_status_allows(status, port):
-                raise Failed(f"UFW Phase A did not show required allow rule before enable: {port}")
+            if not ufw_show_added_allows(staged, port):
+                raise Failed(f"UFW Phase A did not show required staged allow rule before enable: {port}")
         ctx.runner.run(["ufw", "--force", "enable"])
         enabled = ctx.runner.run(["ufw", "status", "verbose"]).stdout
-        for port in ports:
-            if not ufw_status_allows(enabled, port):
-                raise Failed(f"UFW Phase A did not retain required allow rule after enable: {port}")
+        validate_ufw_phase_a_active_status(enabled, ports)
     return StageResult("completed", "UFW Phase A is active with ports 22 and 65500 allowed.", {"firewall_ports": ports})
 
 

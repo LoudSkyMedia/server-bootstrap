@@ -13,6 +13,14 @@ from lsm_vps_init.stages import (
 from lsm_vps_init.util import CommandResult, PathLayout, secure_write
 
 
+ACTIVE_PHASE_A_UFW = (
+    "Status: active\n"
+    "Default: deny (incoming), allow (outgoing), disabled (routed)\n"
+    "22/tcp ALLOW IN Anywhere\n"
+    "65500/tcp ALLOW IN Anywhere\n"
+)
+
+
 class FakeRunner:
     def __init__(self, responses: dict[tuple[str, ...], CommandResult | str]):
         self.responses = responses
@@ -47,7 +55,7 @@ class RevalidationTests(unittest.TestCase):
                 {
                     ("sshd", "-T"): "port 22\n",
                     ("ss", "-tln"): "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n",
-                    ("ufw", "status", "verbose"): "Status: active\n22/tcp ALLOW IN Anywhere\n65500/tcp ALLOW IN Anywhere\n",
+                    ("ufw", "status", "verbose"): ACTIVE_PHASE_A_UFW,
                     ("bash", "-lc", "command -v docker >/dev/null"): CommandResult([], 1, "", ""),
                 }
             )
@@ -61,7 +69,7 @@ class RevalidationTests(unittest.TestCase):
             runner = FakeRunner(
                 {
                     ("ss", "-tln"): "LISTEN 0 128 0.0.0.0:65500 0.0.0.0:*\n",
-                    ("ufw", "status", "verbose"): "Status: active\n22/tcp ALLOW IN Anywhere\n65500/tcp ALLOW IN Anywhere\n",
+                    ("ufw", "status", "verbose"): ACTIVE_PHASE_A_UFW,
                     ("bash", "-lc", "command -v docker >/dev/null"): CommandResult([], 1, "", ""),
                 }
             )
@@ -74,7 +82,7 @@ class RevalidationTests(unittest.TestCase):
             runner = FakeRunner(
                 {
                     ("ss", "-tln"): "LISTEN 0 128 0.0.0.0:65500 0.0.0.0:*\n",
-                    ("ufw", "status", "verbose"): "Status: active\n22/tcp ALLOW IN Anywhere\n65500/tcp ALLOW IN Anywhere\n",
+                    ("ufw", "status", "verbose"): ACTIVE_PHASE_A_UFW,
                     ("bash", "-lc", "command -v docker >/dev/null"): CommandResult([], 0, "", ""),
                     ("docker", "ps", "--format", "{{.Names}}\t{{.Ports}}"): "db\t0.0.0.0:5432->5432/tcp\n",
                 }
@@ -90,7 +98,7 @@ class RevalidationTests(unittest.TestCase):
             runner = FakeRunner(
                 {
                     ("ss", "-tln"): "LISTEN 0 128 0.0.0.0:65500 0.0.0.0:*\n",
-                    ("ufw", "status", "verbose"): "Status: active\n22/tcp ALLOW IN Anywhere\n65500/tcp ALLOW IN Anywhere\n",
+                    ("ufw", "status", "verbose"): ACTIVE_PHASE_A_UFW,
                     ("bash", "-lc", "command -v docker >/dev/null"): CommandResult([], 0, "", ""),
                     ("docker", "ps", "--format", "{{.Names}}\t{{.Ports}}"): "web\t0.0.0.0:80->80/tcp, :::443->443/tcp\n",
                 }
