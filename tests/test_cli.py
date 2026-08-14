@@ -100,6 +100,58 @@ class CliTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertIn("current_stage", payload)
 
+    def test_status_syncs_reboot_required_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            mock_root = Path(tmp) / "root"
+            (mock_root / "etc").mkdir(parents=True)
+            (mock_root / "etc" / "os-release").write_text('ID="ubuntu"\nVERSION_ID="24.04"\n', encoding="utf-8")
+            (mock_root / "var" / "run").mkdir(parents=True)
+            (mock_root / "var" / "run" / "reboot-required").write_text("acceptance-test\n", encoding="utf-8")
+
+            pending = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "lsm_vps_init.cli",
+                    "--dry-run",
+                    "--state-dir",
+                    str(state_dir),
+                    "--mock-root",
+                    str(mock_root),
+                    "status",
+                    "--json",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertTrue(json.loads(pending.stdout)["reboot"]["pending"])
+
+            (mock_root / "var" / "run" / "reboot-required").unlink()
+            cleared = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "lsm_vps_init.cli",
+                    "--dry-run",
+                    "--state-dir",
+                    str(state_dir),
+                    "--mock-root",
+                    str(mock_root),
+                    "status",
+                    "--json",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            reboot = json.loads(cleared.stdout)["reboot"]
+            self.assertFalse(reboot["pending"])
+            self.assertIsNone(reboot["required_since"])
+
 
 if __name__ == "__main__":
     unittest.main()

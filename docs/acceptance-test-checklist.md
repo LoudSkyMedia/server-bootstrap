@@ -1,0 +1,80 @@
+# Disposable VPS Acceptance Checklist
+
+Use this checklist beside `docs/acceptance-test-runbook.md`. Check items only
+after the matching pass criteria are observed on the disposable Ubuntu 24.04
+VPS.
+
+- [ ] Disposable Ubuntu 24.04 VPS created; provider console access confirmed.
+- [ ] Provider firewall allows operator IP to TCP `22` and `65500`.
+- [ ] Rehearsal SSH key created and public key available.
+- [ ] Pre-public archive built from reviewed local checkout and checksum recorded.
+- [ ] `bootstrap.sh` and source archive are available at temporary HTTPS URLs.
+- [ ] Bootstrap starts from `curl -fsSL ... -o /tmp/lsm-vps-bootstrap.sh`.
+- [ ] Local wizard installed at `/usr/local/sbin/lsm-vps-init`.
+- [ ] State/log paths exist with root-only permissions.
+- [ ] `system_update` completed.
+- [ ] Pending-reboot state was observed.
+- [ ] Root recovery password set and not stored in bootstrap state.
+- [ ] `sadmin` exists, has home directory, shell, and sudo group membership.
+- [ ] `sadmin` sudo validation passed.
+- [ ] `/home/sadmin/.env` is `sadmin:sadmin` mode `600`.
+- [ ] Required sudo-password key is present without printing its value.
+- [ ] `/home/sadmin/AGENTS.md` exists.
+- [ ] `sadmin` SSH public key installed in `authorized_keys`.
+- [ ] SSH listens on both `22` and `65500`.
+- [ ] UFW Phase A is active and allows both SSH ports.
+- [ ] Temporary `ExposeAuthInfo` is effective only for the checkpoint path.
+- [ ] Second session proves `sadmin` key-only SSH on port `65500`.
+- [ ] SSH checkpoint state records safe metadata only.
+- [ ] Original SSH session was intentionally lost.
+- [ ] Wizard was resumed through tmux or persistent state.
+- [ ] Mid-initialization reboot was performed.
+- [ ] Post-reboot resume detected boot change and revalidated mutable state.
+- [ ] Management tooling installed, including `gh`, `tmux`, Node.js, and npm.
+- [ ] Node.js version is `20` or newer.
+- [ ] GitHub CLI authentication works as `sadmin`.
+- [ ] Access to both required private repositories is verified.
+- [ ] Codex installed and authenticated as `sadmin`.
+- [ ] Codex config is `model=gpt-5.5` and `model_reasoning_effort=xhigh`.
+- [ ] Codex bypass flag is available and used by bootstrap-managed commands.
+- [ ] VPS Server Manager session ID captured from `thread.started` JSONL.
+- [ ] VPS Server Manager session can be resumed directly.
+- [ ] Relay module selected.
+- [ ] Docker Hosting Stack module selected for dry-run handoff.
+- [ ] Relay repository cloned to `/home/sadmin/codex-vps-discord-relay`.
+- [ ] Relay `.env` is `sadmin:sadmin` mode `600`.
+- [ ] Relay `.env` does not contain the sudo-password key.
+- [ ] Relay Discord allowed-user ACL contains at least one explicit user ID.
+- [ ] Relay approver ACL contains at least one explicit approver or approved no-approval mode was chosen.
+- [ ] Relay preflight passes.
+- [ ] Relay user service is active.
+- [ ] Linger is enabled for `sadmin`.
+- [ ] Codex hook installation completed through the relay repository.
+- [ ] Real Discord to relay to Codex to Discord round trip succeeded.
+- [ ] Relay checkpoint recorded with `sudo lsm-vps-init confirm-relay`.
+- [ ] Final hardening was launched only from an active `sadmin` port-65500 session.
+- [ ] Current SSH session survived final hardening.
+- [ ] Effective SSH config has `PermitRootLogin no`.
+- [ ] Effective SSH config has `PasswordAuthentication no`.
+- [ ] Effective SSH config retains only port `65500`.
+- [ ] Final effective config does not retain `ExposeAuthInfo yes`.
+- [ ] UFW Phase B removed `22/tcp` and retained `65500/tcp`.
+- [ ] fail2ban SSH jail is active on port `65500`.
+- [ ] Unattended upgrades are configured.
+- [ ] New `sadmin` key-only SSH session succeeds on port `65500`.
+- [ ] SSH on port `22` fails after final hardening.
+- [ ] Root SSH fails after final hardening.
+- [ ] Actual listeners inspected; no unexpected public ports are exposed.
+- [ ] Docker Engine is not exposed on TCP `2375` or `2376`.
+- [ ] Reboot after final hardening completed.
+- [ ] Post-final-reboot SSH works on `65500`.
+- [ ] Post-final-reboot SSH on `22` remains unavailable.
+- [ ] Post-final-reboot relay service is active.
+- [ ] Post-final-reboot Codex login status succeeds as `sadmin`.
+- [ ] Post-final-reboot UFW and fail2ban remain active.
+- [ ] Bootstrap status reports complete or only documented residuals.
+- [ ] Docker Hosting Stack module exercised in dry-run/validation mode only.
+- [ ] Installed bootstrap source secret scan passed.
+- [ ] State/log token-shape scan passed.
+- [ ] Final status, listener, UFW, fail2ban, and service evidence captured.
+- [ ] Disposable VPS destroyed after review.

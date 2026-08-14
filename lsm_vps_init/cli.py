@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from .state import StateStore, set_checkpoint, set_stage
+from .state import StateStore, mark_reboot_pending, set_checkpoint, set_stage
 from .stages import (
     Blocked,
     Context,
@@ -39,6 +39,7 @@ def make_context(args: argparse.Namespace) -> tuple[Context, StateStore]:
     layout = PathLayout(mock_root=args.mock_root, state_dir=args.state_dir, log_file=args.log_file)
     store = StateStore(layout.state_file)
     state = store.load()
+    sync_reboot_required_marker(state, store, layout)
     runner = CommandRunner(layout.log_file, dry_run=args.dry_run)
     return (
         Context(
@@ -51,6 +52,18 @@ def make_context(args: argparse.Namespace) -> tuple[Context, StateStore]:
         ),
         store,
     )
+
+
+def sync_reboot_required_marker(state: dict[str, object], store: StateStore, layout: PathLayout) -> None:
+    actual_pending = layout.reboot_required.exists()
+    reboot = state.setdefault("reboot", {})
+    if not isinstance(reboot, dict):
+        return
+    stale_timestamp = not actual_pending and reboot.get("required_since") is not None
+    missing_timestamp = actual_pending and not reboot.get("required_since")
+    if reboot.get("pending") != actual_pending or stale_timestamp or missing_timestamp:
+        mark_reboot_pending(state, actual_pending)
+        store.save(state)
 
 
 def stage_status(ctx: Context) -> list[dict[str, object]]:

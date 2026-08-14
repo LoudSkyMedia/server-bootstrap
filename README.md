@@ -176,6 +176,13 @@ Run the public-safety scan before publishing:
 scripts/secret_scan.sh
 ```
 
+## Acceptance Rehearsal
+
+Before any production use or public release, run the disposable-VPS rehearsal:
+
+- [Acceptance test runbook](docs/acceptance-test-runbook.md)
+- [Acceptance checklist](docs/acceptance-test-checklist.md)
+
 ## Recovery If Bootstrap Stops
 
 Run:
