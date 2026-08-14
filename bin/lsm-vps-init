@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+TMUX_SESSION="${LSM_VPS_INIT_TMUX_SESSION:-lsm-vps-init}"
+
+filtered_args=()
+no_tmux=0
+skip_tmux=0
+for arg in "$@"; do
+  case "$arg" in
+    --no-tmux|--dry-run|--mock-root|--non-interactive|status|verify-ssh|record-ssh-proof|confirm-relay)
+      [[ "$arg" == "--no-tmux" ]] && no_tmux=1
+      [[ "$arg" != "--no-tmux" ]] && filtered_args+=("$arg")
+      skip_tmux=1
+      ;;
+    *)
+      filtered_args+=("$arg")
+      ;;
+  esac
+done
+
+if [[ "$no_tmux" -eq 0 && "$skip_tmux" -eq 0 && -z "${TMUX:-}" && -t 0 && -t 1 ]]; then
+  if command -v tmux >/dev/null 2>&1; then
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+      printf 'Running inside tmux session %s. Reattach with: sudo tmux attach-session -t %s\n' "$TMUX_SESSION" "$TMUX_SESSION" >&2
+    else
+      printf 'Running inside tmux session %s. Reattach with: tmux attach-session -t %s\n' "$TMUX_SESSION" "$TMUX_SESSION" >&2
+    fi
+    exec tmux new-session -A -s "$TMUX_SESSION" -- "$0" --no-tmux "${filtered_args[@]}"
+  else
+    printf 'tmux is not installed yet; continuing without tmux. Persistent state still supports resume.\n' >&2
+  fi
+fi
+
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m lsm_vps_init.cli "${filtered_args[@]}"

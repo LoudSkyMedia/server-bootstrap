@@ -1,0 +1,13 @@
+.env
+*.env
+*.log
+*.pyc
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+state.json
+state/
+logs/
+tmp/
