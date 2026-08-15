@@ -169,7 +169,13 @@ Ubuntu 24.04 reads `/etc/ssh/sshd_config` and
 so SSH changes are made through an owned sshd drop-in and followed by
 `systemctl daemon-reload`. The wizard detects whether `ssh.socket` or
 `ssh.service` is active before deciding whether to restart the socket or the
-service.
+service. The bootstrap-owned SSH drop-in is
+`/etc/ssh/sshd_config.d/00-lsm-vps-init.conf` so its single-value hardening
+keywords are encountered before cloud-init/vendor drop-ins such as
+`50-cloud-init.conf`. Older bootstrap-owned
+`/etc/ssh/sshd_config.d/99-lsm-vps-init.conf` files are migrated by writing the
+new early file, validating sshd configuration, then removing only the obsolete
+bootstrap-owned late file.
 
 The dual-port SSH drop-in enables OpenSSH `ExposeAuthInfo` only inside
 `Match User sadmin`. This is temporary bootstrap instrumentation used solely to

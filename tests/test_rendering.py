@@ -22,6 +22,7 @@ from lsm_vps_init.stages import (
     validate_relay_codex_contract,
     validate_relay_env_policy,
 )
+from lsm_vps_init.util import PathLayout
 
 
 class RenderingTests(unittest.TestCase):
@@ -41,6 +42,12 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("PasswordAuthentication no", rendered)
         self.assertIn("ExposeAuthInfo no", rendered)
         self.assertNotIn("ExposeAuthInfo yes", rendered)
+
+    def test_bootstrap_ssh_dropin_precedes_cloud_init_dropins(self):
+        layout = PathLayout()
+        self.assertEqual(layout.ssh_dropin.name, "00-lsm-vps-init.conf")
+        self.assertLess(layout.ssh_dropin.name, "50-cloud-init.conf")
+        self.assertEqual(layout.legacy_ssh_dropin.name, "99-lsm-vps-init.conf")
 
     def test_firewall_ports_are_capability_derived(self):
         self.assertEqual(firewall_ports_for_modules({}), ["65500/tcp"])

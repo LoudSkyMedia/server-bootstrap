@@ -16,6 +16,7 @@ from lsm_vps_init.stages import (
     StageDefinition,
     StageResult,
     detect_final_host_hardening,
+    install_managed_ssh_dropin,
     render_ssh_dropin,
     run_ssh_dual_port,
     run_final_host_hardening,
@@ -34,6 +35,22 @@ FINAL_GLOBAL = (
     "pubkeyauthentication yes\n"
 )
 FINAL_SADMIN = FINAL_GLOBAL + "exposeauthinfo no\n"
+
+
+def first_value_effective_keywords(config_dir: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for path in sorted(config_dir.glob("*.conf")):
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#") or " " not in stripped:
+                continue
+            key, value = stripped.split(None, 1)
+            key = key.lower()
+            if key not in values:
+                values[key] = value.strip()
+    return values
+
+
 class ScriptedRunner:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -119,6 +136,7 @@ class SshdPrivilegeTests(unittest.TestCase):
                 (("bash", "-lc", mock.ANY), ""),
                 (("sudo", "-n", "sshd", "-t"), ""),
                 (("sudo", "-n", "sshd", "-t"), ""),
+                (("sudo", "-n", "sshd", "-t"), ""),
                 (("sudo", "-n", "sshd", "-T"), "port 22\nport 65500\n"),
                 (("sudo", "-n", "sshd", "-T", "-C", SSHD_SADMIN_MATCH_CRITERIA), dual_sadmin),
                 (("systemctl", "daemon-reload"), ""),
@@ -136,6 +154,66 @@ class SshdPrivilegeTests(unittest.TestCase):
         self.assertIn(("sudo", "-n", "sshd", "-T"), runner.calls)
         self.assertIn(("sudo", "-n", "sshd", "-T", "-C", SSHD_SADMIN_MATCH_CRITERIA), runner.calls)
         self.assertNotIn(("sshd", "-T"), runner.calls)
+
+    def test_early_final_dropin_wins_over_cloud_init_password_auth_yes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = PathLayout(mock_root=Path(tmp) / "root", state_dir=Path(tmp) / "state")
+            config_dir = layout.map("/etc/ssh/sshd_config.d")
+            secure_write(layout.ssh_dropin, render_ssh_dropin("hardened"), 0o644)
+            secure_write(config_dir / "50-cloud-init.conf", "PasswordAuthentication yes\n", 0o644)
+            secure_write(config_dir / "60-cloudimg-settings.conf", "PasswordAuthentication no\n", 0o644)
+
+            effective = first_value_effective_keywords(config_dir)
+
+        self.assertEqual(effective["port"], SSH_PORT)
+        self.assertEqual(effective["permitrootlogin"], "no")
+        self.assertEqual(effective["passwordauthentication"], "no")
+        self.assertEqual(effective["pubkeyauthentication"], "yes")
+        validate_final_sshd_effective_config(FINAL_GLOBAL, FINAL_SADMIN)
+
+    def test_managed_dropin_migrates_legacy_99_file_without_touching_vendor_files(self):
+        runner = ScriptedRunner(
+            [
+                (("sudo", "-n", "sshd", "-t"), ""),
+                (("sudo", "-n", "sshd", "-t"), ""),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = context(tmp, runner)
+            vendor = ctx.layout.map("/etc/ssh/sshd_config.d/50-cloud-init.conf")
+            secure_write(vendor, "PasswordAuthentication yes\n", 0o644)
+            secure_write(ctx.layout.legacy_ssh_dropin, render_ssh_dropin("dual-port"), 0o644)
+
+            install_managed_ssh_dropin(ctx, "hardened")
+
+            new_text = ctx.layout.ssh_dropin.read_text(encoding="utf-8")
+            vendor_text = vendor.read_text(encoding="utf-8")
+            legacy_exists = ctx.layout.legacy_ssh_dropin.exists()
+
+        self.assertIn("PasswordAuthentication no", new_text)
+        self.assertEqual(vendor_text, "PasswordAuthentication yes\n")
+        self.assertFalse(legacy_exists)
+        self.assertEqual(runner.calls, [("sudo", "-n", "sshd", "-t"), ("sudo", "-n", "sshd", "-t")])
+
+    def test_managed_dropin_validation_failure_leaves_legacy_file_for_resume(self):
+        failed_test = CommandResult(["sudo", "-n", "sshd", "-t"], 1, "", "invalid config")
+        runner = ScriptedRunner([(("sudo", "-n", "sshd", "-t"), failed_test)])
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = context(tmp, runner)
+            vendor = ctx.layout.map("/etc/ssh/sshd_config.d/50-cloud-init.conf")
+            secure_write(vendor, "PasswordAuthentication yes\n", 0o644)
+            secure_write(ctx.layout.legacy_ssh_dropin, render_ssh_dropin("dual-port"), 0o644)
+
+            with self.assertRaises(CommandError):
+                install_managed_ssh_dropin(ctx, "hardened")
+
+            new_exists = ctx.layout.ssh_dropin.exists()
+            legacy_exists = ctx.layout.legacy_ssh_dropin.exists()
+            vendor_text = vendor.read_text(encoding="utf-8")
+
+        self.assertTrue(new_exists)
+        self.assertTrue(legacy_exists)
+        self.assertEqual(vendor_text, "PasswordAuthentication yes\n")
 
     def test_user_unreadable_sshd_include_does_not_trigger_unprivileged_validation(self):
         runner = PrivilegeSensitiveRunner()
@@ -176,6 +254,7 @@ class SshdPrivilegeTests(unittest.TestCase):
                 (("sudo", "-n", "sshd", "-t"), ""),
                 (("sudo", "-n", "sshd", "-T"), "port 22\nport 65500\n"),
                 (("sudo", "-n", "sshd", "-T", "-C", SSHD_SADMIN_MATCH_CRITERIA), pre_sadmin),
+                (("sudo", "-n", "sshd", "-t"), ""),
                 (("sudo", "-n", "sshd", "-t"), ""),
                 (("sudo", "-n", "sshd", "-T"), bad_global),
                 (("sudo", "-n", "sshd", "-T", "-C", SSHD_SADMIN_MATCH_CRITERIA), FINAL_SADMIN),

@@ -837,8 +837,13 @@ def run_sadmin_ssh_key(ctx: Context) -> StageResult:
 
 
 def _effective_ssh_ports(ctx: Context) -> set[str]:
-    if ctx.layout.mock_root and ctx.layout.ssh_dropin.exists():
-        return set(re.findall(r"(?mi)^Port\s+(\d+)\s*$", ctx.layout.ssh_dropin.read_text(encoding="utf-8")))
+    if ctx.layout.mock_root:
+        dropin_text = ""
+        for path in (ctx.layout.ssh_dropin, ctx.layout.legacy_ssh_dropin):
+            if path.exists():
+                dropin_text += path.read_text(encoding="utf-8") + "\n"
+        if dropin_text:
+            return set(re.findall(r"(?mi)^Port\s+(\d+)\s*$", dropin_text))
     result = run_privileged_system_command(ctx, ["sshd", "-T"], check=False)
     return set(re.findall(r"(?mi)^port\s+(\d+)\s*$", result.stdout))
 
@@ -888,6 +893,41 @@ def sshd_effective_for_sadmin(ctx: Context) -> str:
     return sshd_effective_for_sadmin_result(ctx).stdout
 
 
+def legacy_ssh_dropin_is_bootstrap_owned(path: Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return "Managed by lsm-vps-init" in text
+
+
+def remove_legacy_ssh_dropin_if_safe(ctx: Context) -> bool:
+    legacy_path = ctx.layout.legacy_ssh_dropin
+    if not os.path.lexists(legacy_path):
+        return False
+    try:
+        link_stat = legacy_path.lstat()
+    except OSError as error:
+        raise Failed("Unable to inspect obsolete bootstrap SSH drop-in before migration cleanup.") from error
+    if not stat.S_ISREG(link_stat.st_mode):
+        raise Failed("Refusing to remove obsolete bootstrap SSH drop-in because it is not a regular file.")
+    if not legacy_ssh_dropin_is_bootstrap_owned(legacy_path):
+        raise Failed("Refusing to remove legacy SSH drop-in path because it is not bootstrap-owned.")
+    legacy_path.unlink()
+    ctx.runner.log("Removed obsolete bootstrap SSH drop-in: /etc/ssh/sshd_config.d/99-lsm-vps-init.conf")
+    return True
+
+
+def install_managed_ssh_dropin(ctx: Context, phase: str) -> None:
+    secure_write(ctx.layout.ssh_dropin, render_ssh_dropin(phase), 0o644)
+    if ctx.dry_run:
+        remove_legacy_ssh_dropin_if_safe(ctx)
+        return
+    sshd_test_config(ctx)
+    remove_legacy_ssh_dropin_if_safe(ctx)
+    sshd_test_config(ctx)
+
+
 def validate_final_sshd_effective_config(global_effective: str, sadmin_effective: str) -> None:
     ports = set(re.findall(r"(?mi)^port\s+(\d+)\s*$", global_effective))
     issues: list[str] = []
@@ -916,16 +956,14 @@ def ssh_listener_present(ctx: Context, port: str) -> bool:
 
 def run_ssh_dual_port(ctx: Context) -> StageResult:
     ctx.require_root()
-    plan = render_ssh_dropin("dual-port")
     if ctx.dry_run and not ctx.layout.mock_root:
         ctx.runner.log("DRY-RUN: would render SSH dual-port drop-in")
         return StageResult("completed", "Would configure SSH to listen on ports 22 and 65500.", {"ports": ["22", SSH_PORT]})
     if not ctx.dry_run:
         backup_ssh_config(ctx)
         sshd_test_config(ctx)
-    secure_write(ctx.layout.ssh_dropin, plan, 0o644)
+    install_managed_ssh_dropin(ctx, "dual-port")
     if not ctx.dry_run:
-        sshd_test_config(ctx)
         sshd_global_effective_config(ctx)
         effective_sadmin = sshd_effective_for_sadmin(ctx)
         if not re.search(r"(?mi)^exposeauthinfo\s+yes$", effective_sadmin):
@@ -1798,9 +1836,8 @@ def run_final_host_hardening(ctx: Context) -> StageResult:
         sshd_test_config(ctx)
         sshd_global_effective_config(ctx)
         sshd_effective_for_sadmin(ctx)
-    secure_write(ctx.layout.ssh_dropin, render_ssh_dropin("hardened"), 0o644)
+    install_managed_ssh_dropin(ctx, "hardened")
     if not ctx.dry_run:
-        sshd_test_config(ctx)
         hardened_global = sshd_global_effective_config(ctx).stdout
         hardened_sadmin = sshd_effective_for_sadmin(ctx)
         validate_final_sshd_effective_config(hardened_global, hardened_sadmin)

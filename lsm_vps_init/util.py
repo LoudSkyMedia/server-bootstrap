@@ -62,6 +62,10 @@ class PathLayout:
 
     @property
     def ssh_dropin(self) -> Path:
+        return self.map("/etc/ssh/sshd_config.d/00-lsm-vps-init.conf")
+
+    @property
+    def legacy_ssh_dropin(self) -> Path:
         return self.map("/etc/ssh/sshd_config.d/99-lsm-vps-init.conf")
 
     @property
