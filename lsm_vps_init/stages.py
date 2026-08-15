@@ -1358,6 +1358,83 @@ RELAY_CONTRACT_KEYS = [
 ]
 
 
+RELAY_NATIVE_BUILD_TOOLS = ("make", "g++", "python3")
+
+
+def relay_native_build_tool_check_script() -> str:
+    tools = " ".join(shlex.quote(tool) for tool in RELAY_NATIVE_BUILD_TOOLS)
+    return f'for c in {tools}; do command -v "$c" >/dev/null 2>&1 || exit 1; done'
+
+
+def render_relay_native_build_prerequisite_install_script() -> str:
+    return r"""
+set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
+wait_for_apt_locks() {
+  local locks=(
+    /var/lib/dpkg/lock
+    /var/lib/dpkg/lock-frontend
+    /var/lib/apt/lists/lock
+    /var/cache/apt/archives/lock
+  )
+  local waited=0
+  while true; do
+    local busy=0
+    for lock in "${locks[@]}"; do
+      if [ -e "$lock" ] && command -v fuser >/dev/null 2>&1 && fuser "$lock" >/dev/null 2>&1; then
+        busy=1
+      fi
+    done
+    if [ "$busy" -eq 0 ]; then
+      return 0
+    fi
+    if [ "$waited" -ge 900 ]; then
+      echo "Timed out waiting for apt/dpkg locks." >&2
+      return 1
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
+wait_for_apt_locks
+apt-get update
+apt-get install -y build-essential
+"""
+
+
+def relay_native_build_prerequisites_present(ctx: Context) -> bool:
+    return ctx.runner.run(["bash", "-lc", relay_native_build_tool_check_script()], check=False).returncode == 0
+
+
+def ensure_relay_native_build_prerequisites(ctx: Context) -> None:
+    if relay_native_build_prerequisites_present(ctx):
+        return
+    result = ctx.runner.run(["bash", "-lc", render_relay_native_build_prerequisite_install_script()], check=False, timeout=1800)
+    if result.returncode != 0:
+        raise Failed(
+            "Discord relay native Node addon build prerequisites could not be installed. "
+            "Ubuntu package build-essential is required for make/g++; python3 is validated separately for node-gyp. "
+            "Repair apt/dpkg state, then resume with `sudo lsm-vps-init resume`."
+        )
+    if not relay_native_build_prerequisites_present(ctx):
+        raise Failed(
+            "Discord relay native Node addon build prerequisite validation failed after installation. "
+            "Required commands: make, g++, python3. Fix the package state, then resume with `sudo lsm-vps-init resume`."
+        )
+
+
+def relay_native_build_failure_hint(result) -> str | None:
+    text = f"{result.stdout}\n{result.stderr}".lower()
+    markers = ("node-gyp", "gyp err", "no prebuilt binary", "not found: make", "better-sqlite3")
+    if not any(marker in text for marker in markers):
+        return None
+    return (
+        "Discord relay installer failed while building a native Node dependency. "
+        "This commonly means node-gyp could not use make/g++/python3 even after bootstrap prerequisite validation. "
+        "Verify `command -v make`, `command -v g++`, and `command -v python3`, inspect the relay npm output, then resume."
+    )
+
+
 def run_discord_relay_install(ctx: Context) -> StageResult:
     if not ctx.state.get("selected_modules", {}).get(RELAY_MODULE):
         return StageResult("completed", "Discord relay module was not selected.")
@@ -1387,8 +1464,15 @@ def run_discord_relay_install(ctx: Context) -> StageResult:
     secure_write(env_path, merge_env_text(existing, updates), 0o600)
     if not ctx.dry_run:
         ctx.runner.run(["chown", "sadmin:sadmin", "/home/sadmin/codex-vps-discord-relay/.env"])
+        ensure_relay_native_build_prerequisites(ctx)
         ctx.sadmin_shell("cd /home/sadmin/codex-vps-discord-relay && chmod +x bin/*.sh bin/preflight.js bin/codex-vps-relay hooks/codex_vps_notify.py")
-        ctx.sadmin_shell("cd /home/sadmin/codex-vps-discord-relay && bin/install-service.sh", timeout=1800)
+        try:
+            ctx.sadmin_shell("cd /home/sadmin/codex-vps-discord-relay && bin/install-service.sh", timeout=1800)
+        except CommandError as error:
+            hint = relay_native_build_failure_hint(error.result)
+            if hint:
+                raise Failed(hint) from error
+            raise
         ctx.sadmin_shell("cd /home/sadmin/codex-vps-discord-relay && bin/install-hook.sh", timeout=300)
         ctx.runner.run(["loginctl", "enable-linger", "sadmin"])
         ctx.sadmin_shell("cd /home/sadmin/codex-vps-discord-relay && npm run preflight", timeout=300)
