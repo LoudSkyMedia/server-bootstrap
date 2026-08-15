@@ -94,6 +94,14 @@ def sanitize_output(value: str, limit: int = 4000) -> str:
     return text[:limit]
 
 
+def redact_specific_values(text: str, values: Iterable[str] | None) -> str:
+    redacted = text
+    for value in values or []:
+        if value:
+            redacted = redacted.replace(value, "[REDACTED]")
+    return redacted
+
+
 class CommandRunner:
     def __init__(self, log_file: Path, dry_run: bool = False):
         self.log_file = log_file
@@ -124,6 +132,7 @@ class CommandRunner:
         env: dict[str, str] | None = None,
         cwd: Path | None = None,
         secret_stdin: bool = False,
+        redact_values: Iterable[str] | None = None,
     ) -> CommandResult:
         self.log(f"$ {redacted_command(args)}")
         if input_text is not None:
@@ -143,8 +152,8 @@ class CommandRunner:
         result = CommandResult(
             args=args,
             returncode=completed.returncode,
-            stdout=sanitize_output(completed.stdout),
-            stderr=sanitize_output(completed.stderr),
+            stdout=redact_specific_values(sanitize_output(completed.stdout), redact_values),
+            stderr=redact_specific_values(sanitize_output(completed.stderr), redact_values),
         )
         if result.stdout:
             self.log(result.stdout.rstrip())

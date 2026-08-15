@@ -36,6 +36,22 @@ class SecurityTests(unittest.TestCase):
             self.assertNotIn(hidden, log_text)
             self.assertEqual(stat.S_IMODE(log_file.stat().st_mode), 0o600)
 
+    def test_known_secret_values_are_redacted_from_child_output_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = Path(tmp) / "bootstrap.log"
+            runner = CommandRunner(log_file, dry_run=False)
+            hidden = "cloudflare-token-output-placeholder"
+            result = runner.run(
+                ["python3", "-c", "import os; print(os.environ['HIDDEN_FOR_TEST'])"],
+                env={"HIDDEN_FOR_TEST": hidden},
+                redact_values=[hidden],
+            )
+            self.assertIn("[REDACTED]", result.stdout)
+            self.assertNotIn(hidden, result.stdout)
+            log_text = log_file.read_text(encoding="utf-8")
+            self.assertIn("[REDACTED]", log_text)
+            self.assertNotIn(hidden, log_text)
+
     def test_secret_scanner_and_redactor_cover_public_risk_patterns(self):
         text = "\n".join(
             [

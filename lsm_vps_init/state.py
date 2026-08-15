@@ -159,11 +159,17 @@ def set_stage(
     if status == "completed":
         record["completed_at"] = utc_now()
         record["blocked_reason"] = None
+    elif status == "in_progress":
+        record["blocked_reason"] = None
     if status in {"blocked", "failed"}:
         record["blocked_reason"] = message or ""
     if evidence:
         record.setdefault("evidence", {}).update(evidence)
-    state["current_stage"] = slug if status != "completed" else state.get("current_stage")
+    if status == "completed":
+        if state.get("current_stage") == slug:
+            state["current_stage"] = None
+    else:
+        state["current_stage"] = slug
 
 
 def set_fact(state: dict[str, Any], key: str, value: Any) -> None:

@@ -57,6 +57,20 @@ class StateTests(unittest.TestCase):
         self.assertFalse(state["reboot"]["pending"])
         self.assertIsNone(state["reboot"]["required_since"])
 
+    def test_stage_retry_and_completion_clear_stale_blocked_reason(self):
+        state = default_state()
+        set_stage(state, "docker_hosting_stack", "blocked", "missing configuration")
+        self.assertEqual(state["current_stage"], "docker_hosting_stack")
+        self.assertEqual(state["stages"]["docker_hosting_stack"]["blocked_reason"], "missing configuration")
+
+        set_stage(state, "docker_hosting_stack", "in_progress")
+        self.assertIsNone(state["stages"]["docker_hosting_stack"]["blocked_reason"])
+        self.assertEqual(state["current_stage"], "docker_hosting_stack")
+
+        set_stage(state, "docker_hosting_stack", "completed")
+        self.assertIsNone(state["stages"]["docker_hosting_stack"]["blocked_reason"])
+        self.assertIsNone(state["current_stage"])
+
 
 if __name__ == "__main__":
     unittest.main()

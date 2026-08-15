@@ -3,7 +3,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from unittest import mock
+
+from lsm_vps_init import cli
+from lsm_vps_init.state import default_state, set_stage
+from lsm_vps_init.stages import Context, StageDefinition, StageResult
+from lsm_vps_init.util import CommandRunner, PathLayout
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -151,6 +159,30 @@ class CliTests(unittest.TestCase):
             reboot = json.loads(cleared.stdout)["reboot"]
             self.assertFalse(reboot["pending"])
             self.assertIsNone(reboot["required_since"])
+
+    def test_status_current_stage_prefers_recorded_blocker_over_stale_detector_gap(self):
+        def no_op(_ctx):
+            return StageResult("completed", "unused")
+
+        fake_stages = [
+            StageDefinition(5, "ssh_dual_port", "Dual SSH", lambda _ctx: False, no_op),
+            StageDefinition(16, "docker_hosting_stack", "Docker", lambda _ctx: False, no_op),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = PathLayout(mock_root=Path(tmp) / "root", state_dir=Path(tmp) / "state")
+            state = default_state()
+            set_stage(state, "ssh_dual_port", "completed")
+            set_stage(state, "docker_hosting_stack", "blocked", "missing configuration")
+            state["current_stage"] = "ssh_dual_port"
+            ctx = Context(layout=layout, state=state, runner=CommandRunner(layout.log_file, dry_run=True), dry_run=True)
+
+            output = StringIO()
+            with mock.patch.object(cli, "STAGES", fake_stages), redirect_stdout(output):
+                cli.print_status(ctx, as_json=True)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["current_stage"], "docker_hosting_stack")
+        self.assertEqual(payload["blocked"][0]["slug"], "docker_hosting_stack")
 
 
 if __name__ == "__main__":

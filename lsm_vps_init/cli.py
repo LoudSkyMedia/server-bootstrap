@@ -92,7 +92,17 @@ def stage_status(ctx: Context) -> list[dict[str, object]]:
 
 def print_status(ctx: Context, *, as_json: bool = False) -> None:
     rows = stage_status(ctx)
-    current = next((row for row in rows if not row["detected"]), None)
+    current = next(
+        (
+            row
+            for row in rows
+            if row["state_status"] in {"blocked", "failed", "in_progress"}
+            or (row["state_status"] == "pending" and not row["detected"])
+        ),
+        None,
+    )
+    if current is None:
+        current = next((row for row in rows if not row["detected"]), None)
     report = {
         "current_stage": current["slug"] if current else None,
         "completed": [row["slug"] for row in rows if row["detected"]],
