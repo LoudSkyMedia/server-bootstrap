@@ -133,7 +133,7 @@ Stage completion is either historical or mutable:
 | `ssh_dual_port` | Transitional mutable | Recheck effective sshd ports include both `22` and `65500` until superseded by `final_host_hardening` |
 | `firewall_phase_a` | Transitional mutable | Recheck UFW is active and allows both `22/tcp` and `65500/tcp` until superseded by `final_host_hardening` |
 | `ssh_recovery_checkpoint` | Historical proof plus mutable dependency | Keep proof metadata, but recheck current `65500` sshd config/listener before lock-down |
-| `management_tooling` | Mutable | Recheck command availability and Node.js major version |
+| `management_tooling` | Mutable | Recheck executable command availability, package-only prerequisites such as `ca-certificates`, and Node.js major version |
 | `github_auth` | Mutable | Re-run `gh auth status` and private-repo access checks |
 | `codex_install_auth` | Mutable | Re-run Codex login/config/bypass/model checks |
 | `codex_manager_session` | Mutable-ish | Recheck a valid session ID is known; downstream relay preflight verifies transcript readability |

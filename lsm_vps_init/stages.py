@@ -53,6 +53,28 @@ DOCKER_N8N_PROVISIONING_ENV_KEYS = (
 DOCKER_HOSTING_MANAGED_ENV_KEYS = (*DOCKER_N8N_PROVISIONING_ENV_KEYS, "SUDO_PASSWORD")
 DOCKER_N8N_REQUIRED_ENV_KEYS = DOCKER_N8N_PROVISIONING_ENV_KEYS
 DOCKER_HOSTING_SECRET_ENV_KEYS = ("CF_API_TOKEN", "SUDO_PASSWORD")
+MANAGEMENT_TOOL_COMMANDS = (
+    "curl",
+    "git",
+    "gh",
+    "jq",
+    "openssl",
+    "python3",
+    "node",
+    "npm",
+    "tmux",
+    "gpg",
+    "gpgv",
+    "xz",
+    "lsb_release",
+    "ufw",
+    "fail2ban-client",
+    "unattended-upgrade",
+)
+MANAGEMENT_TOOL_PACKAGES = (
+    "ca-certificates",
+    "python3-venv",
+)
 NODEJS_RELEASE_KEY_FINGERPRINTS = (
     "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356",
     "DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7",
@@ -1093,24 +1115,27 @@ def run_ssh_recovery(ctx: Context) -> StageResult:
 def detect_management_tooling(ctx: Context) -> bool:
     if ctx.dry_run:
         return detected_stage_by_state(ctx, "management_tooling")
-    checks = [
-        "curl",
-        "ca-certificates",
-        "git",
-        "gh",
-        "jq",
-        "openssl",
-        "python3",
-        "node",
-        "npm",
-        "tmux",
-    ]
-    script = "for c in " + " ".join(shlex.quote(c) for c in checks) + "; do command -v \"$c\" >/dev/null || exit 1; done"
+    script = "for c in " + " ".join(shlex.quote(c) for c in MANAGEMENT_TOOL_COMMANDS) + '; do command -v "$c" >/dev/null || exit 1; done'
     result = ctx.runner.run(["bash", "-lc", script], check=False)
     if result.returncode != 0:
         return False
+    package_result = ctx.runner.run(
+        ["dpkg-query", "-W", "-f=${Status}\\n", *MANAGEMENT_TOOL_PACKAGES],
+        check=False,
+    )
+    if package_result.returncode != 0:
+        return False
+    package_statuses = [line.strip() for line in package_result.stdout.splitlines() if line.strip()]
+    if len(package_statuses) != len(MANAGEMENT_TOOL_PACKAGES):
+        return False
+    if any(line != "install ok installed" for line in package_statuses):
+        return False
     node_version = ctx.runner.run(["node", "-e", "console.log(process.versions.node.split('.')[0])"], check=False)
-    return node_version.returncode == 0 and int(node_version.stdout.strip() or "0") >= 20
+    try:
+        node_major = int(node_version.stdout.strip() or "0")
+    except ValueError:
+        return False
+    return node_version.returncode == 0 and node_major >= 20
 
 
 def run_management_tooling(ctx: Context) -> StageResult:
