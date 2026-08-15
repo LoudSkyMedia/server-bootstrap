@@ -18,6 +18,18 @@ from .stages import (
 from .util import CommandError, CommandRunner, PathLayout
 
 
+def state_stage_status(ctx: Context, slug: str) -> str:
+    return str(ctx.state.get("stages", {}).get(slug, {}).get("status", "pending"))
+
+
+def stage_completed_in_state(ctx: Context, slug: str) -> bool:
+    return state_stage_status(ctx, slug) == "completed"
+
+
+def stage_superseded(ctx: Context, stage) -> bool:
+    return stage_completed_in_state(ctx, stage.slug) and any(stage_completed_in_state(ctx, slug) for slug in stage.superseded_by)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lsm-vps-init")
     parser.add_argument("command", nargs="?", default="resume", choices=["resume", "run", "status", "verify-ssh", "record-ssh-proof", "confirm-relay"])
@@ -83,10 +95,12 @@ def stage_status(ctx: Context) -> list[dict[str, object]]:
                 "title": stage.title,
                 "state_status": record.get("status", "pending"),
                 "detected": detector,
+                "superseded": stage_superseded(ctx, stage),
                 "blocked_reason": record.get("blocked_reason"),
                 "detect_error": detect_error,
             }
         )
+        rows[-1]["satisfied"] = bool(rows[-1]["detected"] or rows[-1]["superseded"])
     return rows
 
 
@@ -97,16 +111,16 @@ def print_status(ctx: Context, *, as_json: bool = False) -> None:
             row
             for row in rows
             if row["state_status"] in {"blocked", "failed", "in_progress"}
-            or (row["state_status"] == "pending" and not row["detected"])
+            or (row["state_status"] == "pending" and not row["satisfied"])
         ),
         None,
     )
     if current is None:
-        current = next((row for row in rows if not row["detected"]), None)
+        current = next((row for row in rows if not row["satisfied"]), None)
     report = {
         "current_stage": current["slug"] if current else None,
-        "completed": [row["slug"] for row in rows if row["detected"]],
-        "pending": [row["slug"] for row in rows if not row["detected"] and row["state_status"] == "pending"],
+        "completed": [row["slug"] for row in rows if row["satisfied"]],
+        "pending": [row["slug"] for row in rows if not row["satisfied"] and row["state_status"] == "pending"],
         "blocked": [row for row in rows if row["state_status"] == "blocked"],
         "failed": [row for row in rows if row["state_status"] == "failed"],
         "selected_modules": ctx.state.get("selected_modules", {}),
@@ -128,7 +142,7 @@ def print_status(ctx: Context, *, as_json: bool = False) -> None:
     print(f"Boot changed since previous run: {str(report['revalidation'].get('boot_changed', False)).lower()}")
     print()
     for row in rows:
-        marker = "done" if row["detected"] else row["state_status"]
+        marker = "done" if row["satisfied"] else row["state_status"]
         print(f"{row['index']:02d} {row['slug']}: {marker}")
         if row.get("blocked_reason"):
             print(f"    blocked: {row['blocked_reason']}")
@@ -178,6 +192,13 @@ def run_stages(ctx: Context, store: StateStore, *, only: str | None = None, unti
         until_index = stage_by_slug(until).index
 
     for stage in STAGES:
+        if stage_superseded(ctx, stage):
+            if ctx.state.get("current_stage") == stage.slug:
+                ctx.state["current_stage"] = None
+                store.save(ctx.state)
+            if until_index is not None and stage.index >= until_index:
+                break
+            continue
         status = execute_stage(ctx, store, stage.slug)
         if status != "completed":
             return 2 if status == "blocked" else 1

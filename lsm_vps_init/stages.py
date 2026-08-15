@@ -331,6 +331,7 @@ class StageDefinition:
     title: str
     detect: Callable[["Context"], bool]
     run: Callable[["Context"], StageResult]
+    superseded_by: tuple[str, ...] = ()
 
 
 @dataclass
@@ -2130,8 +2131,8 @@ STAGES: list[StageDefinition] = [
     StageDefinition(2, "root_password", "Reset root password", detect_root_password, run_root_password),
     StageDefinition(3, "sadmin_user", "Create sadmin", detect_sadmin, run_sadmin),
     StageDefinition(4, "sadmin_ssh_key", "Install sadmin SSH public key", detect_sadmin_ssh_key, run_sadmin_ssh_key),
-    StageDefinition(5, "ssh_dual_port", "Add SSH port 65500 while preserving 22", detect_ssh_dual_port, run_ssh_dual_port),
-    StageDefinition(6, "firewall_phase_a", "Enable UFW with both SSH ports", detect_firewall_phase_a, run_firewall_phase_a),
+    StageDefinition(5, "ssh_dual_port", "Add SSH port 65500 while preserving 22", detect_ssh_dual_port, run_ssh_dual_port, ("final_host_hardening",)),
+    StageDefinition(6, "firewall_phase_a", "Enable UFW with both SSH ports", detect_firewall_phase_a, run_firewall_phase_a, ("final_host_hardening",)),
     StageDefinition(7, "ssh_recovery_checkpoint", "Verify new SSH recovery path", detect_ssh_recovery, run_ssh_recovery),
     StageDefinition(8, "management_tooling", "Install management tooling", detect_management_tooling, run_management_tooling),
     StageDefinition(9, "github_auth", "Authenticate GitHub as sadmin", detect_github_auth, run_github_auth),

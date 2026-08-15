@@ -103,13 +103,15 @@ arguments.
 ## Idempotency Model
 
 Every stage has a detection function. A completed state checkpoint is accepted
-only when the detector still passes or when the stage represents an explicitly
-manual checkpoint that cannot be machine-verified.
+only when the detector still passes, when the stage represents an explicitly
+manual checkpoint that cannot be machine-verified, or when a later completed
+stage intentionally supersedes a temporary transitional state.
 
 Examples:
 
 - `sadmin_user` checks user/group/home and `/home/sadmin/.env` permissions.
-- `ssh_dual_port` checks effective SSH config and listeners.
+- `ssh_dual_port` checks effective SSH config and listeners until final host
+  hardening supersedes the temporary dual-port state.
 - `github_auth` runs `gh auth status` as `sadmin` and verifies access to the
   selected private repositories.
 - `codex_install_auth` runs `codex login status`, checks `--help` for the
@@ -128,8 +130,8 @@ Stage completion is either historical or mutable:
 | `root_password` | Historical | Recheck root has a password status, never store the value |
 | `sadmin_user` | Mutable | Recheck user existence, sudo env-file mode/key, and `/home/sadmin/AGENTS.md` |
 | `sadmin_ssh_key` | Mutable | Recheck `authorized_keys` contains at least one supported public key |
-| `ssh_dual_port` | Mutable | Recheck effective sshd ports include both `22` and `65500` |
-| `firewall_phase_a` | Mutable | Recheck UFW is active and allows both `22/tcp` and `65500/tcp` |
+| `ssh_dual_port` | Transitional mutable | Recheck effective sshd ports include both `22` and `65500` until superseded by `final_host_hardening` |
+| `firewall_phase_a` | Transitional mutable | Recheck UFW is active and allows both `22/tcp` and `65500/tcp` until superseded by `final_host_hardening` |
 | `ssh_recovery_checkpoint` | Historical proof plus mutable dependency | Keep proof metadata, but recheck current `65500` sshd config/listener before lock-down |
 | `management_tooling` | Mutable | Recheck command availability and Node.js major version |
 | `github_auth` | Mutable | Re-run `gh auth status` and private-repo access checks |
@@ -140,6 +142,13 @@ Stage completion is either historical or mutable:
 | `discord_relay_checkpoint` | Historical proof plus mutable dependency | Keep operator round-trip proof, but recheck relay service/preflight before lock-down |
 | `final_host_hardening` | Mutable | Recheck effective SSH, UFW, fail2ban, and Docker exposure |
 | `docker_hosting_stack` | Mutable | Recheck checkout exists and run repo-owned validation/dry-runs before handoff |
+
+Supersession is lifecycle metadata, not a blanket waiver. After
+`final_host_hardening` completes, the expected final state no longer includes
+SSH port `22` or UFW's temporary `22/tcp` allow rule, so status and resume skip
+the earlier transitional detectors. If the final hardening detector later fails,
+the current stage is `final_host_hardening`, not `ssh_dual_port` or
+`firewall_phase_a`.
 
 Immediately before `final_host_hardening`, the wizard revalidates current sshd
 config/listeners, UFW Phase A, relay health when selected, and Docker
