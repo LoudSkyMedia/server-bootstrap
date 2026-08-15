@@ -72,7 +72,7 @@ class FirewallPhaseATests(unittest.TestCase):
 
             with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
                 "lsm_vps_init.stages.os.environ",
-                {"SSH_CONNECTION": "203.0.113.10 52000 159.223.97.195 22"},
+                {"SSH_CONNECTION": "203.0.113.10 52000 198.51.100.20 22"},
                 clear=False,
             ):
                 self.assertFalse(detect_firewall_phase_a(ctx))

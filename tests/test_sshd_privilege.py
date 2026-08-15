@@ -272,7 +272,7 @@ class SshdPrivilegeTests(unittest.TestCase):
 
     def test_ssh_recovery_checkpoint_still_requires_65500_key_only_sadmin_session(self):
         valid_env = {
-            "SSH_CONNECTION": "203.0.113.10 52122 159.223.97.195 65500",
+            "SSH_CONNECTION": "203.0.113.10 52122 198.51.100.20 65500",
             "LSM_VPS_INIT_PUBLICKEY_ONLY": "1",
             "SSH_USER_AUTH": "/tmp/auth-info",
         }
@@ -286,7 +286,7 @@ class SshdPrivilegeTests(unittest.TestCase):
         with self.assertRaises(Blocked):
             ssh_checkpoint_proof_from_env(
                 nonce="nonce-1",
-                env={**valid_env, "SSH_CONNECTION": "203.0.113.10 52122 159.223.97.195 22"},
+                env={**valid_env, "SSH_CONNECTION": "203.0.113.10 52122 198.51.100.20 22"},
                 username="sadmin",
                 auth_reader=lambda _path: "publickey ssh-ed25519 SHA256:example\n",
             )
