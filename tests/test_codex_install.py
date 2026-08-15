@@ -8,8 +8,10 @@ from lsm_vps_init.stages import (
     REQUIRED_CODEX_MODEL,
     REQUIRED_CODEX_REASONING,
     Context,
+    codex_bypass_flag_check_script,
     codex_install_script,
     codex_install_validation_script,
+    codex_model_availability_check_script,
     run_codex_install_auth,
 )
 from lsm_vps_init.util import CommandError, CommandResult, PathLayout
@@ -28,8 +30,8 @@ VALIDATION = sadmin_args(codex_install_validation_script())
 INSTALL = sadmin_args(codex_install_script())
 LOGIN_STATUS = sadmin_args("codex login status")
 LOGIN_DEVICE = sadmin_args("codex login --device-auth")
-HELP = sadmin_args("codex --help")
-MODELS = sadmin_args("codex debug models")
+BYPASS_FLAG_CHECK = sadmin_args(codex_bypass_flag_check_script())
+MODEL_CHECK = sadmin_args(codex_model_availability_check_script())
 CHOWN_NPM = ("chown", "-R", "sadmin:sadmin", "/home/sadmin/.npm-global")
 CHOWN_CODEX = ("chown", "-R", "sadmin:sadmin", "/home/sadmin/.codex")
 
@@ -74,6 +76,7 @@ class CodexInstallTests(unittest.TestCase):
         script = codex_install_script()
         self.assertIn("npm install -g @openai/codex", script)
         self.assertIn("/home/sadmin/.npm-global", script)
+        self.assertIn("codex exec --help", script)
         self.assertNotIn("chatgpt.com/codex/install.sh", script)
         source = (Path(__file__).resolve().parents[1] / "lsm_vps_init" / "stages.py").read_text(encoding="utf-8")
         self.assertNotIn("chatgpt.com/codex/install.sh", source)
@@ -85,8 +88,8 @@ class CodexInstallTests(unittest.TestCase):
                 (INSTALL, ""),
                 (CHOWN_NPM, ""),
                 (LOGIN_STATUS, ""),
-                (HELP, "--dangerously-bypass-approvals-and-sandbox\n"),
-                (MODELS, REQUIRED_CODEX_MODEL),
+                (BYPASS_FLAG_CHECK, ""),
+                (MODEL_CHECK, ""),
                 (CHOWN_CODEX, ""),
             ]
         )
@@ -107,8 +110,8 @@ class CodexInstallTests(unittest.TestCase):
             [
                 (VALIDATION, ""),
                 (LOGIN_STATUS, ""),
-                (HELP, "--dangerously-bypass-approvals-and-sandbox\n"),
-                (MODELS, REQUIRED_CODEX_MODEL),
+                (BYPASS_FLAG_CHECK, ""),
+                (MODEL_CHECK, ""),
                 (CHOWN_CODEX, ""),
             ]
         )
@@ -126,8 +129,8 @@ class CodexInstallTests(unittest.TestCase):
                 (VALIDATION, ""),
                 (LOGIN_STATUS, CommandResult(list(LOGIN_STATUS), 1, "Not logged in", "")),
                 (LOGIN_DEVICE, ""),
-                (HELP, "--dangerously-bypass-approvals-and-sandbox\n"),
-                (MODELS, REQUIRED_CODEX_MODEL),
+                (BYPASS_FLAG_CHECK, ""),
+                (MODEL_CHECK, ""),
                 (CHOWN_CODEX, ""),
             ]
         )
@@ -141,6 +144,24 @@ class CodexInstallTests(unittest.TestCase):
         output = "\n".join(str(call.args[0]) for call in printed.call_args_list if call.args)
         self.assertIn("LOCAL workstation", output)
         self.assertIn("sadmin", output)
+
+    def test_post_auth_validation_uses_subcommand_flag_check_and_structured_model_check(self):
+        runner = ScriptedRunner(
+            [
+                (VALIDATION, ""),
+                (LOGIN_STATUS, ""),
+                (BYPASS_FLAG_CHECK, ""),
+                (MODEL_CHECK, ""),
+                (CHOWN_CODEX, ""),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch("builtins.print"):
+                result = run_codex_install_auth(ctx)
+        self.assertEqual(result.status, "completed")
+        self.assertNotIn(sadmin_args("codex --help"), runner.calls)
+        self.assertNotIn(sadmin_args("codex debug models"), runner.calls)
 
 
 if __name__ == "__main__":

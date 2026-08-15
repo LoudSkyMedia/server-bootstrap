@@ -1477,8 +1477,25 @@ def codex_install_validation_script() -> str:
     return (
         "command -v codex >/dev/null && "
         "codex --version >/dev/null && "
-        "codex --help | grep -q -- '--dangerously-bypass-approvals-and-sandbox'"
+        f"{codex_bypass_flag_check_script()}"
     )
+
+
+def codex_bypass_flag_check_script() -> str:
+    return "codex exec --help | grep -q -- '--dangerously-bypass-approvals-and-sandbox'"
+
+
+def codex_model_availability_check_script() -> str:
+    checker = (
+        "import json,sys; "
+        "data=json.load(sys.stdin); "
+        f"model={json.dumps(REQUIRED_CODEX_MODEL)}; "
+        f"reasoning={json.dumps(REQUIRED_CODEX_REASONING)}; "
+        "ok=any(m.get('slug')==model and any(level.get('effort')==reasoning "
+        "for level in m.get('supported_reasoning_levels', [])) for m in data.get('models', [])); "
+        "sys.exit(0 if ok else 1)"
+    )
+    return f"codex debug models | python3 -c {shlex.quote(checker)}"
 
 
 def codex_install_script() -> str:
@@ -1535,12 +1552,11 @@ def run_codex_install_auth(ctx: Context) -> StageResult:
                 "Never paste OpenAI credentials into arbitrary bootstrap prompts."
             )
             ctx.sadmin_interactive_shell("codex login --device-auth", timeout=900)
-        help_result = ctx.sadmin_shell("codex --help", check=False)
-        if "--dangerously-bypass-approvals-and-sandbox" not in help_result.stdout:
+        if ctx.sadmin_shell(codex_bypass_flag_check_script(), check=False).returncode != 0:
             raise Blocked("Installed Codex CLI does not expose --dangerously-bypass-approvals-and-sandbox. Stop and review Codex version.")
-        models = ctx.sadmin_shell("codex debug models", check=False, timeout=30)
-        if models.returncode == 0 and REQUIRED_CODEX_MODEL not in models.stdout:
-            raise Blocked(f"Codex model catalog does not list {REQUIRED_CODEX_MODEL}; do not downgrade silently.")
+        models = ctx.sadmin_shell(codex_model_availability_check_script(), check=False, timeout=30)
+        if models.returncode != 0:
+            raise Blocked(f"Codex model catalog does not list {REQUIRED_CODEX_MODEL} with reasoning effort {REQUIRED_CODEX_REASONING}; do not downgrade silently.")
     _write_codex_config(ctx)
     return StageResult("completed", f"Codex is installed/authenticated as sadmin and configured for {REQUIRED_CODEX_MODEL} {REQUIRED_CODEX_REASONING}.")
 
