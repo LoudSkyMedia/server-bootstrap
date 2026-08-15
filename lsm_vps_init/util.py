@@ -154,6 +154,31 @@ class CommandRunner:
             raise CommandError(result)
         return result
 
+    def run_interactive(
+        self,
+        args: list[str],
+        *,
+        check: bool = True,
+        timeout: int | None = None,
+        env: dict[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> CommandResult:
+        self.log(f"$ {redacted_command(args)}")
+        if self.dry_run:
+            return CommandResult(args=args, returncode=0, stdout="", stderr="")
+        completed = subprocess.run(
+            args,
+            text=True,
+            check=False,
+            timeout=timeout,
+            env=env,
+            cwd=str(cwd) if cwd else None,
+        )
+        result = CommandResult(args=args, returncode=completed.returncode, stdout="", stderr="")
+        if check and result.returncode != 0:
+            raise CommandError(result)
+        return result
+
 
 def read_os_release(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}

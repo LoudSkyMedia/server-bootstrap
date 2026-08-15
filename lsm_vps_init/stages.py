@@ -394,6 +394,24 @@ class Context:
             timeout=timeout,
         )
 
+    def sadmin_interactive_shell(
+        self,
+        script: str,
+        *,
+        check: bool = True,
+        timeout: int | None = None,
+    ):
+        wrapped = (
+            'export HOME=/home/sadmin; '
+            'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"; '
+            f"{script}"
+        )
+        return self.runner.run_interactive(
+            ["sudo", "-u", "sadmin", "-H", "bash", "-lc", wrapped],
+            check=check,
+            timeout=timeout,
+        )
+
 
 def render_ssh_dropin(phase: str) -> str:
     if phase == "dual-port":
@@ -1019,33 +1037,106 @@ fi
     return StageResult("completed", "Management tooling is installed and Node.js is compatible.")
 
 
-def detect_github_auth(ctx: Context) -> bool:
-    if ctx.dry_run:
-        return detected_stage_by_state(ctx, "github_auth")
+GITHUB_REQUIRED_REPOS = ("LoudSkyMedia/codex-vps-discord-relay", "LoudSkyMedia/docker-hosting-stack")
+
+
+def github_cli_config_permissions_ok(ctx: Context) -> bool:
+    gh_dir = ctx.layout.sadmin_home / ".config" / "gh"
+    if not gh_dir.exists():
+        return True
+    for path in [gh_dir, *gh_dir.rglob("*")]:
+        try:
+            mode = file_mode(path)
+            if mode is None:
+                return False
+            if path.is_dir() and mode & 0o077:
+                return False
+            if path.is_file() and mode & 0o077:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def enforce_github_cli_config_permissions(ctx: Context) -> None:
+    gh_dir = ctx.layout.sadmin_home / ".config" / "gh"
+    if ctx.layout.mock_root:
+        if gh_dir.exists():
+            for path in [gh_dir, *gh_dir.rglob("*")]:
+                if path.is_dir():
+                    os.chmod(path, 0o700)
+                elif path.is_file():
+                    os.chmod(path, 0o600)
+        return
+    script = r"""
+set -Eeuo pipefail
+dir=/home/sadmin/.config/gh
+if [ -d "$dir" ]; then
+  chown -R sadmin:sadmin "$dir"
+  find "$dir" -type d -exec chmod 0700 {} +
+  find "$dir" -type f -exec chmod 0600 {} +
+  if find "$dir" \( -type f -o -type d \) -perm /077 -print -quit | grep -q .; then
+    echo "GitHub CLI config contains group/other-readable entries." >&2
+    exit 1
+  fi
+fi
+"""
+    ctx.runner.run(["bash", "-lc", script])
+
+
+def github_auth_commands_succeed(ctx: Context) -> bool:
     status = ctx.sadmin_shell("gh auth status", check=False)
     if status.returncode != 0:
         return False
-    for repo in ("LoudSkyMedia/codex-vps-discord-relay", "LoudSkyMedia/docker-hosting-stack"):
+    for repo in GITHUB_REQUIRED_REPOS:
         result = ctx.sadmin_shell(f"gh repo view {shlex.quote(repo)} --json nameWithOwner >/dev/null", check=False)
         if result.returncode != 0:
             return False
     return True
 
 
+def github_auth_is_valid(ctx: Context) -> bool:
+    if not github_auth_commands_succeed(ctx):
+        return False
+    return github_cli_config_permissions_ok(ctx)
+
+
+def detect_github_auth(ctx: Context) -> bool:
+    if ctx.dry_run:
+        return detected_stage_by_state(ctx, "github_auth")
+    return github_auth_is_valid(ctx)
+
+
 def run_github_auth(ctx: Context) -> StageResult:
     ctx.require_root()
     if ctx.dry_run:
         return StageResult("completed", "Would authenticate GitHub CLI as sadmin and verify private repo access.", {"dry_run": True})
-    if ctx.sadmin_shell("gh auth status", check=False).returncode != 0:
-        ctx.require_tty("GitHub authentication")
-        if ctx.confirm("Use headless PAT/token login instead of interactive gh auth login?", default=False):
-            token = ctx.prompt_secret("GitHub PAT/token", confirm=False)
-            ctx.sadmin_shell("gh auth login --with-token", input_text=token + "\n", secret_stdin=True)
-        else:
-            ctx.sadmin_shell("gh auth login --hostname github.com --git-protocol https")
+    if github_auth_commands_succeed(ctx):
+        enforce_github_cli_config_permissions(ctx)
+        if not github_cli_config_permissions_ok(ctx):
+            raise Blocked("GitHub CLI auth exists, but config permissions are not root/sadmin-private. Fix permissions and resume.")
+        return StageResult("completed", "GitHub CLI is already authenticated as sadmin and can access required repositories.")
+    ctx.require_tty("GitHub authentication")
+    print(
+        "GitHub authentication will use the web/device OAuth flow by default. "
+        "When GitHub CLI prints a one-time code and URL, open the URL on your local workstation browser."
+    )
+    if ctx.confirm("Use PAT/token fallback instead of GitHub web/device OAuth?", default=False):
+        token = ctx.prompt_secret("GitHub PAT/token", confirm=False)
+        ctx.sadmin_shell("gh auth login --with-token", input_text=token + "\n", secret_stdin=True)
+    else:
+        try:
+            ctx.sadmin_interactive_shell(
+                "GH_BROWSER=echo BROWSER=echo gh auth login --hostname github.com --git-protocol https --web",
+                timeout=900,
+            )
+        except CommandError as error:
+            raise Blocked("GitHub web/device OAuth did not complete. Re-run `sudo lsm-vps-init resume` to retry or explicitly choose PAT fallback.") from error
     ctx.sadmin_shell("gh auth setup-git")
-    for repo in ("LoudSkyMedia/codex-vps-discord-relay", "LoudSkyMedia/docker-hosting-stack"):
+    ctx.sadmin_shell("gh auth status")
+    for repo in GITHUB_REQUIRED_REPOS:
         ctx.sadmin_shell(f"gh repo view {shlex.quote(repo)} --json nameWithOwner >/dev/null")
+    enforce_github_cli_config_permissions(ctx)
     return StageResult("completed", "GitHub CLI is authenticated as sadmin and can access required repositories.")
 
 

@@ -493,12 +493,15 @@ Let the wizard run GitHub authentication as `sadmin`, or run the equivalent
 commands manually if it blocks:
 
 ```bash
-sudo -iu sadmin gh auth login --hostname github.com --git-protocol https
+sudo -iu sadmin env GH_BROWSER=echo BROWSER=echo gh auth login --hostname github.com --git-protocol https --web
 sudo -iu sadmin gh auth setup-git
 sudo -iu sadmin gh auth status
 sudo -iu sadmin gh repo view LoudSkyMedia/codex-vps-discord-relay --json nameWithOwner --jq .nameWithOwner
 sudo -iu sadmin gh repo view LoudSkyMedia/docker-hosting-stack --json nameWithOwner --jq .nameWithOwner
 ```
+
+Open the printed GitHub login URL on the operator workstation browser and enter
+the one-time code shown in the VPS terminal.
 
 Expected result: `gh auth status` succeeds as `sadmin`, and both private repo
 lookups print their repository names.
