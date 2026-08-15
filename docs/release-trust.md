@@ -10,18 +10,17 @@ The source directory can remain named `server-bootstrap`.
 
 ## Channels
 
-Current initial-publication channel:
+Supported moving channel:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LoudSkyMedia/server-bootstrap/main/bootstrap.sh \
+curl -fsSL https://raw.githubusercontent.com/LoudSkyMedia/server-bootstrap/stable/bootstrap.sh \
   -o /tmp/lsm-vps-bootstrap.sh \
   && sudo bash /tmp/lsm-vps-bootstrap.sh
 ```
 
-The bootstrap currently defaults to `main` because no `stable` branch exists
-yet. The future `stable` branch or immutable redirect mechanism should advance
-only after a reviewed release is promoted. It must not track day-to-day
-unaccepted work.
+The bootstrap defaults to `stable`. The `stable` branch or immutable redirect
+mechanism should advance only after a reviewed release is promoted. It must not
+track day-to-day `main` work.
 
 Reproducible version-pinned channels are not published yet. When a real
 immutable release tag exists, use that tag and release checksum with

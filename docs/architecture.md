@@ -305,8 +305,8 @@ relay configuration, or application/container env files.
 The working repository name remains `server-bootstrap`; the recommended public
 remote is `LoudSkyMedia/server-bootstrap`.
 
-Long-term production usage should not depend exclusively on mutable `main`.
-Initial public publication uses `main` until `stable` or immutable tags exist.
+Production usage should not depend on mutable `main`. The bootstrap defaults to
+`stable`, the moving accepted release channel.
 Release process:
 
 1. Publish reviewed immutable tags such as `vX.Y.Z`.

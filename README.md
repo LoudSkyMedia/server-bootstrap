@@ -26,18 +26,17 @@ Supported platform:
 - Ubuntu 24.04 LTS
 
 The disposable Ubuntu 24.04 acceptance rehearsal has passed for this bootstrap.
-The current public install channel is `main` because no `stable` branch or
-immutable version tag exists yet.
+The supported moving install channel is `stable`.
 
 Release-channel policy:
 
-- `main` is the current repository history and initial publication channel.
-- `stable` is planned as the moving accepted-release channel, but it has not
-  been created yet.
+- `main` is development/current repository history and may contain newer work
+  that has not been promoted.
+- `stable` is the moving accepted bootstrap release channel.
+- `stable` is advanced only after acceptance/review.
 - Immutable version tags/releases are planned separately with published
   checksums.
-- Do not use examples that mention `stable` or a concrete `vX.Y.Z` tag until
-  those refs exist in GitHub.
+- No immutable version tag/checksum has been published yet.
 
 ## Before You Start
 
@@ -179,16 +178,17 @@ stack workflow.
 
 ## Start A New VPS
 
-Current initial-publication command:
+Primary supported installation command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LoudSkyMedia/server-bootstrap/main/bootstrap.sh \
+curl -fsSL https://raw.githubusercontent.com/LoudSkyMedia/server-bootstrap/stable/bootstrap.sh \
   -o /tmp/lsm-vps-bootstrap.sh \
   && sudo bash /tmp/lsm-vps-bootstrap.sh
 ```
 
-This command uses `main` because `stable` does not exist yet. Once a `stable`
-branch is created, it should point only to accepted revisions.
+The `stable` branch is the supported moving release channel and should point
+only to accepted revisions. Do not bootstrap new VPS hosts from `main`; it may
+contain newer work that has not completed acceptance.
 
 Version-pinned releases are not published yet. When a real tag exists, use the
 tag and checksum from the GitHub release with `LSM_VPS_INIT_REF=vX.Y.Z` and

@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 PROJECT_NAME="lsm-vps-init"
-DEFAULT_REF="main"
+DEFAULT_REF="stable"
 DEFAULT_REPO="https://github.com/LoudSkyMedia/server-bootstrap"
 INSTALL_ROOT="/usr/local/lib/lsm-vps-init"
 BIN_PATH="/usr/local/sbin/lsm-vps-init"
