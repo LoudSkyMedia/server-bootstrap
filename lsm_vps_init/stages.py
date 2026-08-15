@@ -53,6 +53,8 @@ DOCKER_N8N_PROVISIONING_ENV_KEYS = (
 DOCKER_HOSTING_MANAGED_ENV_KEYS = (*DOCKER_N8N_PROVISIONING_ENV_KEYS, "SUDO_PASSWORD")
 DOCKER_N8N_REQUIRED_ENV_KEYS = DOCKER_N8N_PROVISIONING_ENV_KEYS
 DOCKER_HOSTING_SECRET_ENV_KEYS = ("CF_API_TOKEN", "SUDO_PASSWORD")
+DEFAULT_SSH_IDENTITY_HINT = "~/.ssh/lsm_vps_ed25519"
+STAGE_TOTAL = 16
 MANAGEMENT_TOOL_COMMANDS = (
     "curl",
     "git",
@@ -71,6 +73,87 @@ MANAGEMENT_TOOL_COMMANDS = (
     "fail2ban-client",
     "unattended-upgrade",
 )
+
+
+STAGE_INTROS = {
+    "root_password": (
+        2,
+        "Root recovery password",
+        "Set a new root password for provider-console or out-of-band recovery. This is a secret. "
+        "The bootstrap never stores it.",
+    ),
+    "sadmin_user": (
+        3,
+        "sadmin sudo account",
+        "`sadmin` is the daily administrative account. Its sudo password is secret and is retained only in "
+        "/home/sadmin/.env as SUDO_PASSWORD for approved stdin-based automation.",
+    ),
+    "sadmin_ssh_key": (
+        4,
+        "sadmin SSH public key",
+        "Paste only the public .pub line generated on your local workstation. Never paste or upload the private key.",
+    ),
+    "ssh_dual_port": (
+        5,
+        "SSH dual-port transition",
+        "SSH will listen on both 22 and 65500. Keep the original SSH session open until the second-session proof succeeds.",
+    ),
+    "firewall_phase_a": (
+        6,
+        "UFW Phase A",
+        "UFW will be enabled with both SSH ports explicitly allowed. Port 22 is intentionally retained for now.",
+    ),
+    "ssh_recovery_checkpoint": (
+        7,
+        "SSH recovery checkpoint",
+        "Run the generated command from a second local workstation terminal. It proves sadmin key-only SSH on port 65500.",
+    ),
+    "management_tooling": (
+        8,
+        "Management tooling",
+        "Install the base tools required for GitHub, Codex, SSH hardening, firewalling, and selected modules.",
+    ),
+    "github_auth": (
+        9,
+        "GitHub authentication",
+        "Authenticate GitHub CLI as sadmin. No graphical browser opens on the VPS; use the displayed URL/code on your LOCAL workstation.",
+    ),
+    "codex_install_auth": (
+        10,
+        "Codex installation and authentication",
+        "Install @openai/codex for sadmin, then authenticate Codex. Browser authorization happens on your LOCAL workstation.",
+    ),
+    "codex_manager_session": (
+        11,
+        "VPS Server Manager Codex session",
+        "Create and verify a persistent Codex session rooted at /home/sadmin using the required model and reasoning settings.",
+    ),
+    "repository_selection": (
+        12,
+        "Repository module selection",
+        "Choose which private Loud Sky Media capabilities this VPS should install now. You can resume later.",
+    ),
+    "discord_relay_install": (
+        13,
+        "Discord relay configuration",
+        "Configure the private Discord relay. The bot token is secret; IDs are copied from Discord Developer Mode.",
+    ),
+    "discord_relay_checkpoint": (
+        14,
+        "Discord relay round trip",
+        "Verify a real Discord message reaches the VPS Server Manager Codex session and returns a Discord reply.",
+    ),
+    "final_host_hardening": (
+        15,
+        "Final SSH and firewall hardening",
+        "After recovery SSH and relay management are verified, remove port 22 and disable root/password SSH.",
+    ),
+    "docker_hosting_stack": (
+        16,
+        "Docker Hosting Stack handoff",
+        "Collect selected hosting values, validate the private stack, and run its dry-run workflow.",
+    ),
+}
 MANAGEMENT_TOOL_PACKAGES = (
     "ca-certificates",
     "python3-venv",
@@ -253,6 +336,60 @@ Do not load `/home/sadmin/.env` with arbitrary `source` behavior. Use a
 deliberate key/value parser and feed sudo through stdin only when elevation is
 explicitly approved.
 """
+
+
+def stage_intro(ctx: Context, slug: str) -> None:
+    if ctx.dry_run and not ctx.layout.mock_root:
+        return
+    intro = STAGE_INTROS.get(slug)
+    if not intro:
+        return
+    index, title, body = intro
+    print()
+    print("=" * 60)
+    print(f"Stage {index:02d}/{STAGE_TOTAL} - {title}")
+    print("=" * 60)
+    print(body)
+    if ctx.state.get("reboot", {}).get("pending"):
+        print()
+        print("Ubuntu requires a reboot.")
+        print("Do not reboot yet. Bootstrap is first establishing verified SSH recovery and management access.")
+
+
+def confirm_ready_or_pause(ctx: Context, prompt: str, pause_reason: str) -> None:
+    if ctx.dry_run:
+        return
+    if not ctx.confirm(prompt + " Choose no to pause setup and resume later.", default=True):
+        raise Blocked(pause_reason + " Resume with `sudo lsm-vps-init resume` when ready.")
+
+
+def write_browser_handoff(ctx: Context, name: str, label: str) -> Path:
+    path = ctx.layout.state_dir / name
+    script = (
+        "#!/bin/sh\n"
+        "printf '\\n%s authorization request:\\n' " + shlex.quote(label) + "\n"
+        "printf '%s\\n\\n' \"$1\"\n"
+        "printf 'Open this URL in your LOCAL workstation browser and complete authorization.\\n'\n"
+        "printf 'No graphical browser is being opened on this VPS.\\n\\n'\n"
+    )
+    secure_write(path, script, 0o700)
+    return path
+
+
+def headless_browser_env_prefix(path: Path) -> str:
+    browser = shlex.quote(str(path))
+    return f"GH_BROWSER={browser} BROWSER={browser}"
+
+
+def shell_quote_local_path_hint(path: str) -> str:
+    if path == "~":
+        return "~"
+    if path.startswith("~/"):
+        remainder = path[2:]
+        if re.fullmatch(r"[A-Za-z0-9_./@%+=:,~-]+", remainder):
+            return "~/" + remainder
+        return "~/" + shlex.quote(remainder)
+    return shlex.quote(path)
 
 
 def ssh_connection_server_port(ssh_connection: str) -> str | None:
@@ -740,6 +877,7 @@ def run_root_password(ctx: Context) -> StageResult:
     ctx.require_root()
     if ctx.dry_run:
         return StageResult("completed", "Would securely set the root recovery password.", {"dry_run": True})
+    stage_intro(ctx, "root_password")
     password = ctx.prompt_secret("New root password")
     ctx.runner.run(["chpasswd"], input_text=f"root:{password}\n", secret_stdin=True)
     return StageResult("completed", "Root recovery password was set.", {"account_status": "set"})
@@ -777,6 +915,7 @@ def run_sadmin(ctx: Context) -> StageResult:
     if ctx.dry_run and not ctx.layout.mock_root:
         return StageResult("completed", "Would create/update sadmin and /home/sadmin/.env.", {"dry_run": True})
 
+    stage_intro(ctx, "sadmin_user")
     password = "dry-run-password"
     if not ctx.dry_run:
         password = ctx.prompt_secret("New sadmin sudo password")
@@ -841,6 +980,7 @@ def run_sadmin_ssh_key(ctx: Context) -> StageResult:
     ctx.require_root()
     if ctx.dry_run and not ctx.layout.mock_root:
         return StageResult("completed", "Would validate and install an sadmin SSH public key.", {"dry_run": True})
+    stage_intro(ctx, "sadmin_ssh_key")
     key = os.environ.get("LSM_VPS_INIT_SSH_PUBLIC_KEY", "").strip()
     if not key and not ctx.dry_run:
         key = ctx.prompt_text("Paste sadmin SSH public key")
@@ -859,6 +999,17 @@ def run_sadmin_ssh_key(ctx: Context) -> StageResult:
         ssh_dir.mkdir(parents=True, mode=0o700)
     if not ctx.dry_run:
         ctx.runner.run(["chown", "-R", "sadmin:sadmin", "/home/sadmin/.ssh"])
+    if "ssh_identity_file_hint" not in ctx.state.get("facts", {}):
+        hint = os.environ.get("LSM_VPS_INIT_SSH_IDENTITY_FILE", "").strip()
+        if not hint and not ctx.dry_run:
+            print()
+            print("Local SSH identity path hint")
+            print("This is only the local workstation path shown in future SSH commands.")
+            print("Do not paste private-key contents, upload the key, or enter the key passphrase here.")
+            hint = ctx.prompt_text("Local private-key path to show in SSH commands", default=DEFAULT_SSH_IDENTITY_HINT)
+        if not hint:
+            hint = DEFAULT_SSH_IDENTITY_HINT
+        set_fact(ctx.state, "ssh_identity_file_hint", hint)
     return StageResult("completed", "sadmin authorized_keys contains a validated public key.")
 
 
@@ -982,6 +1133,7 @@ def ssh_listener_present(ctx: Context, port: str) -> bool:
 
 def run_ssh_dual_port(ctx: Context) -> StageResult:
     ctx.require_root()
+    stage_intro(ctx, "ssh_dual_port")
     if ctx.dry_run and not ctx.layout.mock_root:
         ctx.runner.log("DRY-RUN: would render SSH dual-port drop-in")
         return StageResult("completed", "Would configure SSH to listen on ports 22 and 65500.", {"ports": ["22", SSH_PORT]})
@@ -1019,6 +1171,7 @@ def detect_firewall_phase_a(ctx: Context) -> bool:
 
 def run_firewall_phase_a(ctx: Context) -> StageResult:
     ctx.require_root()
+    stage_intro(ctx, "firewall_phase_a")
     current_port = ssh_connection_server_port(os.environ.get("SSH_CONNECTION", ""))
     ports = render_ufw_phase_a_plan(current_port)
     if ctx.dry_run and not ctx.layout.mock_root:
@@ -1078,6 +1231,7 @@ def detect_ssh_recovery(ctx: Context) -> bool:
 
 
 def run_ssh_recovery(ctx: Context) -> StageResult:
+    stage_intro(ctx, "ssh_recovery_checkpoint")
     ip = ctx.state.get("facts", {}).get("public_ipv4")
     if not ip and not ctx.dry_run:
         ip = public_ipv4(ctx.runner)
@@ -1088,6 +1242,12 @@ def run_ssh_recovery(ctx: Context) -> StageResult:
     if not nonce:
         nonce = secrets.token_hex(12)
         set_fact(ctx.state, "ssh_recovery_nonce", nonce)
+    identity_hint = (
+        os.environ.get("LSM_VPS_INIT_SSH_IDENTITY_FILE", "").strip()
+        or ctx.state.get("facts", {}).get("ssh_identity_file_hint")
+        or DEFAULT_SSH_IDENTITY_HINT
+    )
+    set_fact(ctx.state, "ssh_identity_file_hint", identity_hint)
     bin_path = str(DEFAULT_BIN_PATH)
     remote_command = (
         f"proof=\"$(LSM_VPS_INIT_PUBLICKEY_ONLY=1 {shlex.quote(bin_path)} "
@@ -1099,12 +1259,16 @@ def run_ssh_recovery(ctx: Context) -> StageResult:
         f"rc=$?; rm -f \"${{proof_file:-}}\"; exit \"$rc\""
     )
     command = (
-        f"ssh -tt -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no "
+        f"ssh -tt -i {shell_quote_local_path_hint(identity_hint)} -o IdentitiesOnly=yes "
+        f"-o PasswordAuthentication=no -o KbdInteractiveAuthentication=no "
         f"-o PreferredAuthentications=publickey -p {SSH_PORT} "
         f"sadmin@{ip} {shlex.quote(remote_command)}"
     )
     message = (
-        "Hard checkpoint: open a second terminal and prove key-based SSH recovery before continuing.\n"
+        "Hard checkpoint: open a SECOND LOCAL workstation terminal and prove key-based SSH recovery before continuing.\n"
+        "Leave the original VPS session open. Edit the -i path if your workstation path differs. "
+        "A local private-key passphrase prompt and a remote sadmin sudo password prompt are expected. "
+        "Never copy the private key to the VPS.\n"
         f"Run: {command}"
     )
     if ctx.dry_run:
@@ -1140,6 +1304,7 @@ def detect_management_tooling(ctx: Context) -> bool:
 
 def run_management_tooling(ctx: Context) -> StageResult:
     ctx.require_root()
+    stage_intro(ctx, "management_tooling")
     script = r"""
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -1281,18 +1446,21 @@ def run_github_auth(ctx: Context) -> StageResult:
         if not github_cli_config_permissions_ok(ctx):
             raise Blocked("GitHub CLI auth exists, but config permissions are not root/sadmin-private. Fix permissions and resume.")
         return StageResult("completed", "GitHub CLI is already authenticated as sadmin and can access required repositories.")
+    stage_intro(ctx, "github_auth")
     ctx.require_tty("GitHub authentication")
     print(
-        "GitHub authentication will use the web/device OAuth flow by default. "
-        "When GitHub CLI prints a one-time code and URL, open the URL on your local workstation browser."
+        "GitHub authentication requires your LOCAL workstation browser.\n"
+        "No graphical browser will be opened on this VPS.\n"
+        "GitHub CLI will provide an authorization URL/code; open it locally and complete authorization."
     )
     if ctx.confirm("Use PAT/token fallback instead of GitHub web/device OAuth?", default=False):
         token = ctx.prompt_secret("GitHub PAT/token", confirm=False)
         ctx.sadmin_shell("gh auth login --with-token", input_text=token + "\n", secret_stdin=True)
     else:
+        handoff = write_browser_handoff(ctx, "github-browser-handoff.sh", "GitHub")
         try:
             ctx.sadmin_interactive_shell(
-                "GH_BROWSER=echo BROWSER=echo gh auth login --hostname github.com --git-protocol https --web",
+                f"{headless_browser_env_prefix(handoff)} gh auth login --hostname github.com --git-protocol https --web",
                 timeout=900,
             )
         except CommandError as error:
@@ -1305,13 +1473,30 @@ def run_github_auth(ctx: Context) -> StageResult:
     return StageResult("completed", "GitHub CLI is authenticated as sadmin and can access required repositories.")
 
 
+def codex_install_validation_script() -> str:
+    return (
+        "command -v codex >/dev/null && "
+        "codex --version >/dev/null && "
+        "codex --help | grep -q -- '--dangerously-bypass-approvals-and-sandbox'"
+    )
+
+
+def codex_install_script() -> str:
+    return (
+        "set -Eeuo pipefail; "
+        "mkdir -p /home/sadmin/.npm-global; "
+        "npm config set prefix /home/sadmin/.npm-global; "
+        "npm install -g @openai/codex; "
+        f"{codex_install_validation_script()}"
+    )
+
+
 def detect_codex_install_auth(ctx: Context) -> bool:
     if ctx.dry_run:
         return detected_stage_by_state(ctx, "codex_install_auth")
     script = (
-        "command -v codex >/dev/null && "
+        f"{codex_install_validation_script()} && "
         "codex login status >/dev/null && "
-        "codex --help | grep -q -- '--dangerously-bypass-approvals-and-sandbox' && "
         "test -f /home/sadmin/.codex/config.toml"
     )
     if ctx.sadmin_shell(script, check=False).returncode != 0:
@@ -1336,15 +1521,20 @@ def run_codex_install_auth(ctx: Context) -> StageResult:
     ctx.require_root()
     if ctx.dry_run and not ctx.layout.mock_root:
         return StageResult("completed", "Would install/auth Codex as sadmin and configure gpt-5.5 xhigh.", {"dry_run": True})
+    stage_intro(ctx, "codex_install_auth")
     if not ctx.dry_run:
-        if ctx.sadmin_shell("command -v codex >/dev/null", check=False).returncode != 0:
-            ctx.sadmin_shell(
-                "curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/openai-codex-install.sh "
-                "&& sh /tmp/openai-codex-install.sh"
-            )
+        if ctx.sadmin_shell(codex_install_validation_script(), check=False).returncode != 0:
+            ctx.sadmin_shell(codex_install_script(), timeout=1800)
+            ctx.runner.run(["chown", "-R", "sadmin:sadmin", "/home/sadmin/.npm-global"])
         if ctx.sadmin_shell("codex login status", check=False).returncode != 0:
             ctx.require_tty("Codex authentication")
-            ctx.sadmin_shell("codex login")
+            print(
+                "Codex authentication is being performed for sadmin.\n"
+                "Browser authorization happens on your LOCAL workstation; the VPS should not launch a graphical browser.\n"
+                "The bootstrap will validate authentication after completion.\n"
+                "Never paste OpenAI credentials into arbitrary bootstrap prompts."
+            )
+            ctx.sadmin_interactive_shell("codex login --device-auth", timeout=900)
         help_result = ctx.sadmin_shell("codex --help", check=False)
         if "--dangerously-bypass-approvals-and-sandbox" not in help_result.stdout:
             raise Blocked("Installed Codex CLI does not expose --dangerously-bypass-approvals-and-sandbox. Stop and review Codex version.")
@@ -1362,6 +1552,7 @@ def detect_codex_manager_session(ctx: Context) -> bool:
 
 def run_codex_manager_session(ctx: Context) -> StageResult:
     ctx.require_root()
+    stage_intro(ctx, "codex_manager_session")
     if ctx.dry_run:
         session_id = os.environ.get("LSM_VPS_INIT_MOCK_CODEX_SESSION_ID", "00000000-0000-4000-8000-000000000001")
         set_fact(ctx.state, "codex_session_id", session_id)
@@ -1400,6 +1591,7 @@ def detect_repository_selection(ctx: Context) -> bool:
 
 
 def run_repository_selection(ctx: Context) -> StageResult:
+    stage_intro(ctx, "repository_selection")
     env_modules = os.environ.get("LSM_VPS_INIT_MODULES", "").strip()
     if env_modules:
         selected = {item.strip() for item in env_modules.split(",") if item.strip()}
@@ -1557,6 +1749,22 @@ def relay_existing_values_are_complete(ctx: Context, values: dict[str, str]) -> 
     return all(relay_existing_value_valid(ctx, key, values.get(key, "")) for key in relay_env_prompt_keys())
 
 
+def print_discord_setup_guidance() -> None:
+    print()
+    print("Discord relay setup")
+    print("Prepare these values before continuing:")
+    print("- Developer Portal: create/select Application -> Bot.")
+    print("- Bot token: SECRET from the Bot page. Paste only into the hidden bootstrap prompt.")
+    print("- Never paste the token into Discord messages, GitHub, docs, or shell command arguments.")
+    print("- Rotate the token immediately if it is exposed.")
+    print("- Required intents: Message Content Intent ON; Presence Intent OFF; Server Members Intent OFF.")
+    print("- Install type: Guild Install only.")
+    print("- Permissions: View Channel, Send Messages, Embed Links, Attach Files, Read Message History.")
+    print("- Permission integer: 117760.")
+    print("- Enable Discord Developer Mode, then copy Server ID, Channel ID, and trusted operator User IDs.")
+    print("- Allowed approver IDs grant separate remote approval authority; leaving them empty disables remote approvals.")
+
+
 def _relay_env_updates(ctx: Context, existing_values: dict[str, str] | None = None) -> dict[str, str]:
     defaults = _relay_env_defaults(ctx)
     if ctx.dry_run:
@@ -1572,6 +1780,14 @@ def _relay_env_updates(ctx: Context, existing_values: dict[str, str] | None = No
         return updates
     existing_values = existing_values or {}
     updates = dict(defaults)
+    missing = [key for key in relay_env_prompt_keys() if not relay_existing_value_valid(ctx, key, existing_values.get(key, ""))]
+    if missing:
+        print_discord_setup_guidance()
+        confirm_ready_or_pause(
+            ctx,
+            "Are the Discord bot token and required Discord IDs ready now?",
+            "Paused before Discord relay configuration.",
+        )
     if relay_existing_value_valid(ctx, "DISCORD_BOT_TOKEN", existing_values.get("DISCORD_BOT_TOKEN", "")):
         updates["DISCORD_BOT_TOKEN"] = existing_values["DISCORD_BOT_TOKEN"]
     else:
@@ -1746,6 +1962,7 @@ def run_discord_relay_install(ctx: Context) -> StageResult:
     if not ctx.state.get("selected_modules", {}).get(RELAY_MODULE):
         return StageResult("completed", "Discord relay module was not selected.")
     ctx.require_root()
+    stage_intro(ctx, "discord_relay_install")
     repo_path = ctx.layout.sadmin_home / "codex-vps-discord-relay"
     if ctx.dry_run and not ctx.layout.mock_root:
         return StageResult("blocked", "Would clone/configure relay and run its installer; functional values are required on a real VPS.", {"dry_run": True})
@@ -1800,6 +2017,7 @@ def detect_discord_relay_checkpoint(ctx: Context) -> bool:
 def run_discord_relay_checkpoint(ctx: Context) -> StageResult:
     if not ctx.state.get("selected_modules", {}).get(RELAY_MODULE):
         return StageResult("completed", "Discord relay module was not selected.")
+    stage_intro(ctx, "discord_relay_checkpoint")
     instruction = (
         "Post this in the configured Discord channel from an allowed user: "
         "`Reply with the hostname and say lsm relay checkpoint ok.` "
@@ -1833,6 +2051,7 @@ def detect_final_host_hardening(ctx: Context) -> bool:
 
 def run_final_host_hardening(ctx: Context) -> StageResult:
     ctx.require_root()
+    stage_intro(ctx, "final_host_hardening")
     if ctx.dry_run and not ctx.layout.mock_root:
         if not ctx.state.get("checkpoints", {}).get("ssh_recovery_verified"):
             raise Blocked("Refusing hardening: sadmin SSH recovery on port 65500 is not verified.")
@@ -2007,6 +2226,19 @@ def docker_existing_value_valid(key: str, value: str) -> bool:
     return validate_docker_n8n_env_value(key, value)
 
 
+def print_docker_n8n_guidance() -> None:
+    print()
+    print("Docker Hosting Stack n8n setup")
+    print("Prepare these values before continuing:")
+    print("- CADDY_ACME_EMAIL: email used by Caddy for ACME/certificate operations.")
+    print("- CF_ACCOUNT_ID: Cloudflare account ID from the Cloudflare dashboard account URL/sidebar.")
+    print("- CF_API_TOKEN: SECRET created in Cloudflare API Tokens with least privilege.")
+    print("- N8N_HOSTNAME: public hostname intended for the n8n instance; DNS must be ready for validation.")
+    print("- Cloudflare token guidance: Zone read for audited zones; DNS edit only for changed zones; Account read only if validation requires it.")
+    print("- N8N_ENCRYPTION_KEY is not collected into the hosting repository .env.")
+    print("  It belongs to the hosting stack's protected n8n secret workflow.")
+
+
 def _prompt_docker_n8n_value(ctx: Context, key: str) -> str:
     if key == "CADDY_ACME_EMAIL":
         value = ctx.prompt_text("Caddy ACME email for n8n HTTPS certificates")
@@ -2027,6 +2259,14 @@ def _prompt_docker_n8n_value(ctx: Context, key: str) -> str:
 
 def docker_n8n_env_updates(ctx: Context, existing_values: dict[str, str]) -> dict[str, str]:
     updates: dict[str, str] = {}
+    missing = [key for key in DOCKER_N8N_PROVISIONING_ENV_KEYS if not docker_existing_value_valid(key, existing_values.get(key, ""))]
+    if missing:
+        print_docker_n8n_guidance()
+        confirm_ready_or_pause(
+            ctx,
+            "Are the Docker/n8n provisioning values ready now?",
+            "Paused before Docker Hosting Stack n8n configuration.",
+        )
     for key in DOCKER_N8N_PROVISIONING_ENV_KEYS:
         if docker_existing_value_valid(key, existing_values.get(key, "")):
             continue
@@ -2104,6 +2344,7 @@ def run_docker_hosting_stack(ctx: Context) -> StageResult:
     if not ctx.state.get("selected_modules", {}).get(DOCKER_MODULE):
         return StageResult("completed", "Docker hosting stack module was not selected.")
     ctx.require_root()
+    stage_intro(ctx, "docker_hosting_stack")
     if ctx.dry_run:
         return StageResult(
             "completed",

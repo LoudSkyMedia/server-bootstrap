@@ -18,6 +18,16 @@ DEFAULT_INSTALL_ROOT = Path("/usr/local/lib/lsm-vps-init")
 DEFAULT_BIN_PATH = Path("/usr/local/sbin/lsm-vps-init")
 SADMIN_USER = "sadmin"
 SADMIN_HOME = Path("/home/sadmin")
+LOCAL_ENV_ALLOWED_KEYS = {
+    "N8N1_VPS_IPV4",
+    "N8N1_VPS_IPV6",
+    "N8N1_VPS_USERNAME",
+    "N8N1_VPS_SUDO_PASSWORD",
+    "N8N1_VPS_SSH_KEY",
+    "VPS_SSH_HOST",
+    "VPS_SSH_IDENTITY_FILE",
+    "SUDO_PASSWORD",
+}
 
 
 @dataclass
@@ -32,6 +42,10 @@ class CommandError(RuntimeError):
     def __init__(self, result: CommandResult):
         super().__init__(f"command failed with {result.returncode}: {redacted_command(result.args)}")
         self.result = result
+
+
+class LocalEnvConflict(ValueError):
+    pass
 
 
 class PathLayout:
@@ -106,6 +120,31 @@ def redact_specific_values(text: str, values: Iterable[str] | None) -> str:
     return redacted
 
 
+def parse_allowed_local_env(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key not in LOCAL_ENV_ALLOWED_KEYS:
+            continue
+        value = parse_env_value(text, key)
+        values[key] = value or ""
+    return values
+
+
+def validate_local_env_contract(values: dict[str, str]) -> None:
+    canonical_password = values.get("N8N1_VPS_SUDO_PASSWORD")
+    fallback_password = values.get("SUDO_PASSWORD")
+    if canonical_password and fallback_password and canonical_password != fallback_password:
+        raise LocalEnvConflict("N8N1_VPS_SUDO_PASSWORD differs from SUDO_PASSWORD")
+    canonical_key = values.get("N8N1_VPS_SSH_KEY")
+    fallback_key = values.get("VPS_SSH_IDENTITY_FILE")
+    if canonical_key and fallback_key and os.path.expanduser(canonical_key) != os.path.expanduser(fallback_key):
+        raise LocalEnvConflict("N8N1_VPS_SSH_KEY differs from VPS_SSH_IDENTITY_FILE")
+
+
 class CommandRunner:
     def __init__(self, log_file: Path, dry_run: bool = False):
         self.log_file = log_file
@@ -143,16 +182,33 @@ class CommandRunner:
             self.log("<stdin: redacted>" if secret_stdin else f"<stdin: {len(input_text)} bytes>")
         if self.dry_run:
             return CommandResult(args=args, returncode=0, stdout="", stderr="")
-        completed = subprocess.run(
-            args,
-            input=input_text,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout,
-            env=env,
-            cwd=str(cwd) if cwd else None,
-        )
+        try:
+            completed = subprocess.run(
+                args,
+                input=input_text,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+                env=env,
+                cwd=str(cwd) if cwd else None,
+            )
+        except subprocess.TimeoutExpired as error:
+            stdout = error.stdout if isinstance(error.stdout, str) else ""
+            stderr = error.stderr if isinstance(error.stderr, str) else ""
+            result = CommandResult(
+                args=args,
+                returncode=124,
+                stdout=redact_specific_values(sanitize_output(stdout), redact_values),
+                stderr=redact_specific_values(sanitize_output((stderr + "\ncommand timed out").strip()), redact_values),
+            )
+            if result.stdout:
+                self.log(result.stdout.rstrip())
+            if result.stderr:
+                self.log(result.stderr.rstrip())
+            if check:
+                raise CommandError(result)
+            return result
         result = CommandResult(
             args=args,
             returncode=completed.returncode,
@@ -179,14 +235,21 @@ class CommandRunner:
         self.log(f"$ {redacted_command(args)}")
         if self.dry_run:
             return CommandResult(args=args, returncode=0, stdout="", stderr="")
-        completed = subprocess.run(
-            args,
-            text=True,
-            check=False,
-            timeout=timeout,
-            env=env,
-            cwd=str(cwd) if cwd else None,
-        )
+        try:
+            completed = subprocess.run(
+                args,
+                text=True,
+                check=False,
+                timeout=timeout,
+                env=env,
+                cwd=str(cwd) if cwd else None,
+            )
+        except subprocess.TimeoutExpired:
+            result = CommandResult(args=args, returncode=124, stdout="", stderr="command timed out")
+            self.log(result.stderr)
+            if check:
+                raise CommandError(result)
+            return result
         result = CommandResult(args=args, returncode=completed.returncode, stdout="", stderr="")
         if check and result.returncode != 0:
             raise CommandError(result)

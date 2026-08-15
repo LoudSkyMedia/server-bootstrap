@@ -184,6 +184,58 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["current_stage"], "docker_hosting_stack")
         self.assertEqual(payload["blocked"][0]["slug"], "docker_hosting_stack")
 
+    def test_status_labels_failed_records_as_failed_not_blocked(self):
+        def no_op(_ctx):
+            return StageResult("completed", "unused")
+
+        fake_stages = [
+            StageDefinition(10, "codex_install_auth", "Codex", lambda _ctx: False, no_op),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = PathLayout(mock_root=Path(tmp) / "root", state_dir=Path(tmp) / "state")
+            state = default_state()
+            set_stage(state, "codex_install_auth", "failed", "command failed with 124")
+            ctx = Context(layout=layout, state=state, runner=CommandRunner(layout.log_file, dry_run=True), dry_run=True)
+
+            output = StringIO()
+            with mock.patch.object(cli, "STAGES", fake_stages), redirect_stdout(output):
+                cli.print_status(ctx, as_json=False)
+
+        text = output.getvalue()
+        self.assertIn("10 codex_install_auth: failed", text)
+        self.assertIn("    failed: command failed with 124", text)
+        self.assertNotIn("    blocked: command failed with 124", text)
+
+    def test_resume_retries_previously_failed_codex_stage(self):
+        calls = []
+
+        def repair(_ctx):
+            calls.append("codex")
+            return StageResult("completed", "repaired")
+
+        fake_stages = [
+            StageDefinition(10, "codex_install_auth", "Codex", lambda _ctx: False, repair),
+        ]
+
+        def fake_stage_by_slug(slug):
+            return fake_stages[0]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = PathLayout(mock_root=Path(tmp) / "root", state_dir=Path(tmp) / "state")
+            store = cli.StateStore(layout.state_file)
+            state = store.load()
+            set_stage(state, "codex_install_auth", "failed", "old installer failed")
+            store.save(state)
+            ctx = Context(layout=layout, state=store.load(), runner=CommandRunner(layout.log_file, dry_run=True), dry_run=True)
+
+            with mock.patch.object(cli, "STAGES", fake_stages), mock.patch.object(cli, "stage_by_slug", fake_stage_by_slug):
+                result = cli.run_stages(ctx, store)
+            updated = store.load()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, ["codex"])
+        self.assertEqual(updated["stages"]["codex_install_auth"]["status"], "completed")
+
     def test_status_reports_complete_when_transitional_stages_are_superseded_by_final_hardening(self):
         def no_op(_ctx):
             return StageResult("completed", "unused")

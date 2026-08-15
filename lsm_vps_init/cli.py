@@ -140,14 +140,44 @@ def print_status(ctx: Context, *, as_json: bool = False) -> None:
     print(f"Current stage: {report['current_stage'] or 'complete'}")
     print(f"Reboot pending: {str(report['reboot'].get('pending', False)).lower()}")
     print(f"Boot changed since previous run: {str(report['revalidation'].get('boot_changed', False)).lower()}")
+    if report["reboot"].get("pending") and report["current_stage"]:
+        print()
+        print("Ubuntu requires a reboot.")
+        print("Do not reboot yet. Bootstrap is first establishing verified SSH recovery and management access.")
+    elif report["reboot"].get("pending") and not report["current_stage"]:
+        print()
+        print("Initialization is complete, but Ubuntu requires a reboot.")
+        print("Reboot: sudo reboot")
+        print("Reconnect through the final sadmin SSH path, then verify: sudo lsm-vps-init status")
     print()
     for row in rows:
         marker = "done" if row["satisfied"] else row["state_status"]
         print(f"{row['index']:02d} {row['slug']}: {marker}")
         if row.get("blocked_reason"):
-            print(f"    blocked: {row['blocked_reason']}")
+            label = "failed" if row["state_status"] == "failed" else "blocked"
+            print(f"    {label}: {row['blocked_reason']}")
         if row.get("detect_error"):
             print(f"    detect note: {row['detect_error']}")
+
+
+def print_stage_stop_summary(ctx: Context, stage, status: str, reason: str) -> None:
+    if status == "blocked":
+        print("Bootstrap paused at a required checkpoint.", file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"Current stage: {stage.slug}", file=sys.stderr)
+        print(file=sys.stderr)
+        print("Required action:", file=sys.stderr)
+        print(f"    {reason}", file=sys.stderr)
+    else:
+        print("Bootstrap stopped because a stage failed.", file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"Current stage: {stage.slug}", file=sys.stderr)
+        print(file=sys.stderr)
+        print("Reason:", file=sys.stderr)
+        print(f"    {reason}", file=sys.stderr)
+    print(file=sys.stderr)
+    print(f"Diagnostic log: {ctx.layout.log_file}", file=sys.stderr)
+    print("Resume after repair: sudo lsm-vps-init resume", file=sys.stderr)
 
 
 def execute_stage(ctx: Context, store: StateStore, stage_slug: str) -> str:
@@ -164,17 +194,19 @@ def execute_stage(ctx: Context, store: StateStore, stage_slug: str) -> str:
     except Blocked as error:
         set_stage(ctx.state, stage.slug, "blocked", str(error))
         store.save(ctx.state)
-        print(f"BLOCKED at {stage.slug}: {error}", file=sys.stderr)
+        print_stage_stop_summary(ctx, stage, "blocked", str(error))
         return "blocked"
     except (Failed, CommandError) as error:
         set_stage(ctx.state, stage.slug, "failed", str(error))
         store.save(ctx.state)
-        print(f"FAILED at {stage.slug}: {error}", file=sys.stderr)
+        print_stage_stop_summary(ctx, stage, "failed", str(error))
         return "failed"
     if result.status == "blocked":
         set_stage(ctx.state, stage.slug, "blocked", result.message, result.evidence)
+        print_stage_stop_summary(ctx, stage, "blocked", result.message)
     elif result.status == "failed":
         set_stage(ctx.state, stage.slug, "failed", result.message, result.evidence)
+        print_stage_stop_summary(ctx, stage, "failed", result.message)
     else:
         set_stage(ctx.state, stage.slug, "completed", result.message, result.evidence)
     store.save(ctx.state)
@@ -204,7 +236,22 @@ def run_stages(ctx: Context, store: StateStore, *, only: str | None = None, unti
             return 2 if status == "blocked" else 1
         if until_index is not None and stage.index >= until_index:
             break
-    print("All selected initialization stages are complete.")
+    print("Loud Sky Media VPS initialization completed successfully.")
+    if ctx.state.get("reboot", {}).get("pending"):
+        identity = ctx.state.get("facts", {}).get("ssh_identity_file_hint") or "~/.ssh/lsm_vps_ed25519"
+        ip = ctx.state.get("facts", {}).get("public_ipv4") or "SERVER_IP"
+        print()
+        print("Initialization is complete, but Ubuntu requires a reboot.")
+        print()
+        print("Reboot:")
+        print("    sudo reboot")
+        print()
+        print("Reconnect:")
+        print(f"    ssh -p 65500 -i {identity} sadmin@{ip}")
+        print()
+        print("Verify:")
+        print("    sudo lsm-vps-init status")
+        print("    sudo lsm-vps-init resume")
     return 0
 
 

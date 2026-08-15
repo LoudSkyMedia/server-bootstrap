@@ -110,7 +110,7 @@ class LauncherTests(unittest.TestCase):
                 cwd=temp,
             )
             self.assertEqual(resume.returncode, 0, resume.stderr)
-            self.assertIn("All selected initialization stages are complete.", resume.stdout)
+            self.assertIn("Loud Sky Media VPS initialization completed successfully.", resume.stdout)
 
     def test_launcher_fails_clearly_when_package_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -125,6 +125,16 @@ class LauncherTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 127)
             self.assertIn("does not contain lsm_vps_init Python package", result.stderr)
+
+    def test_tmux_wrapper_reports_active_blocked_failed_and_success_states(self):
+        launcher = (ROOT / "bin" / "lsm-vps-init").read_text(encoding="utf-8")
+        self.assertIn("Bootstrap is running inside tmux session", launcher)
+        self.assertIn("Bootstrap paused at a required checkpoint.", launcher)
+        self.assertIn("Bootstrap stopped because a stage failed.", launcher)
+        self.assertIn("Loud Sky Media VPS initialization completed successfully.", launcher)
+        self.assertIn("--no-tmux status", launcher)
+        self.assertIn("Press Enter to close this tmux pane", launcher)
+        self.assertIn("new-session -A -s", launcher)
 
 
 if __name__ == "__main__":

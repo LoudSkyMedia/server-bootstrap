@@ -418,6 +418,18 @@ class DiscordRelayPrerequisiteTests(unittest.TestCase):
         self.assertEqual(prompts.secret_prompts, [])
         self.assertEqual(prompts.text_prompts, ["Discord channel ID for the VPS session"])
 
+    def test_missing_discord_values_can_pause_before_secret_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, ScriptedRunner([]))
+            prompts = PromptRecorder({})
+            prompts.attach(ctx)
+            ctx.confirm = lambda _prompt, default=False: False
+            with self.assertRaises(Blocked) as caught:
+                _relay_env_updates(ctx, {})
+        self.assertIn("Paused before Discord relay configuration", str(caught.exception))
+        self.assertEqual(prompts.secret_prompts, [])
+        self.assertEqual(prompts.text_prompts, [])
+
     def test_existing_env_with_unsafe_mode_is_rejected_before_reuse(self):
         uid = str(os.getuid())
         with tempfile.TemporaryDirectory() as tmp:

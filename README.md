@@ -8,6 +8,28 @@ before private server-management repositories take over.
 On a fresh Ubuntu 24.04 VPS, download the accepted `stable` bootstrap script
 and run it as root. The wizard is resumable if your SSH session disconnects.
 
+Download:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/LoudSkyMedia/server-bootstrap/stable/bootstrap.sh \
+  -o /tmp/lsm-vps-bootstrap.sh
+```
+
+Optional inspection:
+
+```bash
+less /tmp/lsm-vps-bootstrap.sh
+```
+
+Run:
+
+```bash
+sudo bash /tmp/lsm-vps-bootstrap.sh
+```
+
+Convenience combined download-and-run command:
+
 ```bash
 curl -fsSL \
   https://raw.githubusercontent.com/LoudSkyMedia/server-bootstrap/stable/bootstrap.sh \
@@ -343,6 +365,27 @@ because Docker-published traffic is not assumed to be constrained by UFW alone.
 
 Use dry-run and mocks. Do not run the wizard against the development machine's
 real SSH, firewall, users, or package manager.
+
+Local acceptance control can use a gitignored `.env` containing only explicit
+keys:
+
+```text
+N8N1_VPS_IPV4=
+N8N1_VPS_IPV6=
+N8N1_VPS_USERNAME=
+N8N1_VPS_SUDO_PASSWORD=
+N8N1_VPS_SSH_KEY=
+VPS_SSH_HOST=
+VPS_SSH_IDENTITY_FILE=
+SUDO_PASSWORD=
+```
+
+New machine-specific tooling should prefer `N8N1_VPS_SSH_KEY` and
+`N8N1_VPS_SUDO_PASSWORD`. `VPS_SSH_IDENTITY_FILE` and `SUDO_PASSWORD` are
+compatibility aliases. If canonical and compatibility values are both present
+and differ, tooling must stop rather than choose between them. SSH key variables
+are pathnames only; private-key contents must never be read into logs, output,
+or repository files.
 
 ```bash
 python3 -m unittest discover -s tests

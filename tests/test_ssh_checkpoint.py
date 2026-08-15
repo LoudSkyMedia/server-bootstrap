@@ -9,6 +9,7 @@ from lsm_vps_init.stages import (
     Context,
     record_ssh_checkpoint_proof,
     run_ssh_recovery,
+    shell_quote_local_path_hint,
     ssh_checkpoint_proof_from_env,
 )
 from lsm_vps_init.util import CommandRunner, PathLayout
@@ -105,11 +106,20 @@ class SshCheckpointTests(unittest.TestCase):
                 run_ssh_recovery(ctx)
             message = str(caught.exception)
             self.assertIn("ssh -tt", message)
+            self.assertIn("-i ~/.ssh/lsm_vps_ed25519", message)
+            self.assertIn("IdentitiesOnly=yes", message)
             self.assertIn("PasswordAuthentication=no", message)
             self.assertIn("KbdInteractiveAuthentication=no", message)
             self.assertIn("PreferredAuthentications=publickey", message)
             self.assertIn("record-ssh-proof", message)
             self.assertIn("verify-ssh --emit-proof", message)
+            self.assertNotIn("OPENSSH PRIVATE KEY", message)
+            self.assertEqual(ctx.state["facts"]["ssh_identity_file_hint"], "~/.ssh/lsm_vps_ed25519")
+
+    def test_local_identity_hint_preserves_tilde_expansion_and_quotes_unusual_paths(self):
+        self.assertEqual(shell_quote_local_path_hint("~/.ssh/lsm_vps_ed25519"), "~/.ssh/lsm_vps_ed25519")
+        self.assertEqual(shell_quote_local_path_hint("~/ssh keys/admin key"), "~/'ssh keys/admin key'")
+        self.assertEqual(shell_quote_local_path_hint("/tmp/admin key"), "'/tmp/admin key'")
 
 
 if __name__ == "__main__":

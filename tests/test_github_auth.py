@@ -1,3 +1,4 @@
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -75,8 +76,15 @@ STATUS = sadmin_args("gh auth status")
 SETUP_GIT = sadmin_args("gh auth setup-git")
 RELAY_VIEW = sadmin_args("gh repo view LoudSkyMedia/codex-vps-discord-relay --json nameWithOwner >/dev/null")
 STACK_VIEW = sadmin_args("gh repo view LoudSkyMedia/docker-hosting-stack --json nameWithOwner >/dev/null")
-OAUTH = sadmin_args("GH_BROWSER=echo BROWSER=echo gh auth login --hostname github.com --git-protocol https --web")
 PAT = sadmin_args("gh auth login --with-token")
+
+
+def oauth_args(ctx):
+    handoff = ctx.layout.state_dir / "github-browser-handoff.sh"
+    return sadmin_args(
+        f"GH_BROWSER={shlex.quote(str(handoff))} BROWSER={shlex.quote(str(handoff))} "
+        "gh auth login --hostname github.com --git-protocol https --web"
+    )
 
 
 class GitHubAuthTests(unittest.TestCase):
@@ -110,25 +118,40 @@ class GitHubAuthTests(unittest.TestCase):
         self.assertEqual(runner.responses, [])
 
     def test_device_web_oauth_path_streams_login_and_verifies_access(self):
-        runner = ScriptedRunner(
-            [
-                (STATUS, CommandResult(list(STATUS), 1, "", "")),
-                (OAUTH, ""),
-                (SETUP_GIT, ""),
-                (STATUS, ""),
-                (RELAY_VIEW, ""),
-                (STACK_VIEW, ""),
-            ]
-        )
         with tempfile.TemporaryDirectory() as tmp:
-            ctx = make_context(tmp, runner)
+            ctx = make_context(tmp, ScriptedRunner([]))
+            oauth = oauth_args(ctx)
+            runner = ScriptedRunner(
+                [
+                    (STATUS, CommandResult(list(STATUS), 1, "", "")),
+                    (oauth, ""),
+                    (SETUP_GIT, ""),
+                    (STATUS, ""),
+                    (RELAY_VIEW, ""),
+                    (STACK_VIEW, ""),
+                ]
+            )
+            ctx.runner = runner
             make_interactive(ctx, confirm_value=False)
             with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch("builtins.print"):
                 result = run_github_auth(ctx)
+            self.assertTrue((ctx.layout.state_dir / "github-browser-handoff.sh").exists())
         self.assertEqual(result.status, "completed")
-        self.assertEqual(runner.interactive_calls, [OAUTH])
+        self.assertEqual(runner.interactive_calls, [oauth])
         self.assertEqual(runner.secret_stdin_calls, [])
         self.assertEqual(runner.responses, [])
+        self.assertNotIn("xdg-open", " ".join(oauth))
+        self.assertNotIn("firefox", " ".join(oauth))
+
+    def test_device_web_oauth_path_does_not_use_graphical_browser_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, ScriptedRunner([]))
+            oauth = oauth_args(ctx)
+        command = " ".join(oauth)
+        self.assertIn("GH_BROWSER=", command)
+        self.assertIn("BROWSER=", command)
+        for graphical in ("xdg-open", "sensible-browser", "firefox", "chromium", "google-chrome"):
+            self.assertNotIn(graphical, command)
 
     def test_pat_fallback_reads_token_from_secret_stdin_and_verifies_access(self):
         runner = ScriptedRunner(
@@ -153,23 +176,25 @@ class GitHubAuthTests(unittest.TestCase):
         self.assertEqual(runner.responses, [])
 
     def test_failed_oauth_blocks_and_resume_can_retry(self):
-        failing_runner = ScriptedRunner(
-            [
-                (STATUS, CommandResult(list(STATUS), 1, "", "")),
-                (OAUTH, CommandResult(list(OAUTH), 1, "", "cancelled")),
-            ]
-        )
         with tempfile.TemporaryDirectory() as tmp:
-            ctx = make_context(tmp, failing_runner)
-            make_interactive(ctx, confirm_value=False)
+            failing_ctx = make_context(tmp, ScriptedRunner([]))
+            oauth = oauth_args(failing_ctx)
+            failing_runner = ScriptedRunner(
+                [
+                    (STATUS, CommandResult(list(STATUS), 1, "", "")),
+                    (oauth, CommandResult(list(oauth), 1, "", "cancelled")),
+                ]
+            )
+            failing_ctx.runner = failing_runner
+            make_interactive(failing_ctx, confirm_value=False)
             with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch("builtins.print"):
                 with self.assertRaises(Blocked):
-                    run_github_auth(ctx)
+                    run_github_auth(failing_ctx)
 
             retry_runner = ScriptedRunner(
                 [
                     (STATUS, CommandResult(list(STATUS), 1, "", "")),
-                    (OAUTH, ""),
+                    (oauth, ""),
                     (SETUP_GIT, ""),
                     (STATUS, ""),
                     (RELAY_VIEW, ""),
@@ -181,7 +206,7 @@ class GitHubAuthTests(unittest.TestCase):
             with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch("builtins.print"):
                 result = run_github_auth(ctx)
         self.assertEqual(result.status, "completed")
-        self.assertEqual(retry_runner.interactive_calls, [OAUTH])
+        self.assertEqual(retry_runner.interactive_calls, [oauth])
 
     def test_github_cli_config_permissions_are_checked_without_reading_token(self):
         with tempfile.TemporaryDirectory() as tmp:

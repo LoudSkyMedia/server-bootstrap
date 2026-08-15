@@ -1,6 +1,11 @@
 import subprocess
+import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
 
+from lsm_vps_init.state import default_state
 from lsm_vps_init.stages import (
     DOCKER_MODULE,
     NODEJS_VERSION,
@@ -8,6 +13,8 @@ from lsm_vps_init.stages import (
     REQUIRED_CODEX_MODEL,
     REQUIRED_CODEX_REASONING,
     Blocked,
+    Context,
+    STAGE_INTROS,
     codex_config_has_required_defaults,
     codex_exec_args,
     extract_codex_session_id,
@@ -17,15 +24,52 @@ from lsm_vps_init.stages import (
     render_ssh_dropin,
     render_nodejs_install_script,
     render_ufw_phase_a_plan,
+    stage_intro,
     upsert_codex_config,
     ufw_status_allows,
     validate_relay_codex_contract,
     validate_relay_env_policy,
 )
-from lsm_vps_init.util import PathLayout
+from lsm_vps_init.util import CommandRunner, PathLayout
 
 
 class RenderingTests(unittest.TestCase):
+    def test_operator_stage_intros_include_headings_and_credential_guidance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = PathLayout(mock_root=Path(tmp) / "root", state_dir=Path(tmp) / "state")
+            state = default_state()
+            state["reboot"]["pending"] = True
+            ctx = Context(layout=layout, state=state, runner=CommandRunner(layout.log_file, dry_run=True), dry_run=False)
+            output = StringIO()
+            with redirect_stdout(output):
+                stage_intro(ctx, "github_auth")
+                stage_intro(ctx, "codex_install_auth")
+                stage_intro(ctx, "discord_relay_install")
+                stage_intro(ctx, "docker_hosting_stack")
+        text = output.getvalue()
+        self.assertIn("Stage 09/16 - GitHub authentication", text)
+        self.assertIn("Stage 10/16 - Codex installation and authentication", text)
+        self.assertIn("Stage 13/16 - Discord relay configuration", text)
+        self.assertIn("Stage 16/16 - Docker Hosting Stack handoff", text)
+        self.assertIn("LOCAL workstation", text)
+        self.assertIn("Ubuntu requires a reboot.", text)
+
+    def test_meaningful_interactive_stages_have_guidance_entries(self):
+        for slug in (
+            "root_password",
+            "sadmin_user",
+            "sadmin_ssh_key",
+            "ssh_dual_port",
+            "ssh_recovery_checkpoint",
+            "github_auth",
+            "codex_install_auth",
+            "discord_relay_install",
+            "discord_relay_checkpoint",
+            "final_host_hardening",
+            "docker_hosting_stack",
+        ):
+            self.assertIn(slug, STAGE_INTROS)
+
     def test_dual_port_ssh_config_keeps_22(self):
         rendered = render_ssh_dropin("dual-port")
         self.assertIn("Port 22", rendered)

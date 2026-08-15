@@ -12,6 +12,7 @@ from lsm_vps_init.stages import (
     DOCKER_MODULE,
     Blocked,
     Context,
+    docker_n8n_env_updates,
     run_docker_hosting_stack,
 )
 from lsm_vps_init.util import CommandResult, PathLayout, merge_env_text, parse_env_value
@@ -54,11 +55,13 @@ class PromptRecorder:
         self.values = values
         self.secret_prompts = []
         self.text_prompts = []
+        self.confirm_prompts = []
 
     def attach(self, ctx):
         ctx.require_tty = lambda _purpose: None
         ctx.prompt_secret = self.prompt_secret
         ctx.prompt_text = self.prompt_text
+        ctx.confirm = self.confirm
 
     def prompt_secret(self, prompt, *, confirm=True):
         self.secret_prompts.append(prompt)
@@ -75,6 +78,10 @@ class PromptRecorder:
         if required:
             raise AssertionError(f"unexpected text prompt: {prompt}")
         return ""
+
+    def confirm(self, prompt, *, default=False):
+        self.confirm_prompts.append(prompt)
+        return default
 
 
 class ScriptedRunner:
@@ -397,6 +404,19 @@ class DockerHostingStackTests(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("sudo credential", message)
         self.assertNotIn("Cloudflare account ID/token permissions", message)
+
+    def test_missing_n8n_values_can_pause_before_prompting(self):
+        runner = ScriptedRunner([])
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            prompts = PromptRecorder({})
+            prompts.attach(ctx)
+            ctx.confirm = lambda _prompt, default=False: False
+            with self.assertRaises(Blocked) as caught:
+                docker_n8n_env_updates(ctx, {})
+        self.assertIn("Paused before Docker Hosting Stack n8n configuration", str(caught.exception))
+        self.assertEqual(prompts.secret_prompts, [])
+        self.assertEqual(prompts.text_prompts, [])
 
 
 if __name__ == "__main__":

@@ -33,11 +33,43 @@ done
 if [[ "$no_tmux" -eq 0 && "$skip_tmux" -eq 0 && -z "${TMUX:-}" && -t 0 && -t 1 ]]; then
   if command -v tmux >/dev/null 2>&1; then
     if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-      printf 'Running inside tmux session %s. Reattach with: sudo tmux attach-session -t %s\n' "$TMUX_SESSION" "$TMUX_SESSION" >&2
+      printf 'Bootstrap is running inside tmux session: %s\n' "$TMUX_SESSION" >&2
+      printf 'Detach: Ctrl-b then d\n' >&2
+      printf 'Reattach: sudo tmux attach-session -t %s\n' "$TMUX_SESSION" >&2
     else
-      printf 'Running inside tmux session %s. Reattach with: tmux attach-session -t %s\n' "$TMUX_SESSION" "$TMUX_SESSION" >&2
+      printf 'Bootstrap is running inside tmux session: %s\n' "$TMUX_SESSION" >&2
+      printf 'Detach: Ctrl-b then d\n' >&2
+      printf 'Reattach: tmux attach-session -t %s\n' "$TMUX_SESSION" >&2
     fi
-    exec tmux new-session -A -s "$TMUX_SESSION" -- "$0" --no-tmux "${filtered_args[@]}"
+    exec tmux new-session -A -s "$TMUX_SESSION" -- bash -lc '
+      session="$1"
+      shift
+      launcher="$1"
+      printf "Bootstrap is running inside tmux session: %s\n\n" "$session"
+      "$@"
+      rc=$?
+      printf "\n"
+      case "$rc" in
+        0)
+          printf "Loud Sky Media VPS initialization completed successfully.\n"
+          ;;
+        2)
+          printf "Bootstrap paused at a required checkpoint.\n\n"
+          "$launcher" --no-tmux status || true
+          ;;
+        *)
+          printf "Bootstrap stopped because a stage failed.\n\n"
+          "$launcher" --no-tmux status || true
+          ;;
+      esac
+      printf "\nDiagnostic log: /var/log/lsm-vps-init/bootstrap.log\n"
+      printf "Resume after repair: sudo lsm-vps-init resume\n"
+      if [ -t 0 ]; then
+        printf "\nPress Enter to close this tmux pane, or detach with Ctrl-b then d.\n"
+        IFS= read -r _unused || true
+      fi
+      exit "$rc"
+    ' bash "$TMUX_SESSION" "$0" --no-tmux "${filtered_args[@]}"
   else
     printf 'tmux is not installed yet; continuing without tmux. Persistent state still supports resume.\n' >&2
   fi
