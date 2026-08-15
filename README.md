@@ -3,6 +3,18 @@
 Public, resumable bootstrap framework for preparing a fresh Loud Sky Media VPS
 before private server-management repositories take over.
 
+## Quick Start
+
+On a fresh Ubuntu 24.04 VPS, download the accepted `stable` bootstrap script
+and run it as root. The wizard is resumable if your SSH session disconnects.
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/LoudSkyMedia/server-bootstrap/stable/bootstrap.sh \
+  -o /tmp/lsm-vps-bootstrap.sh \
+  && sudo bash /tmp/lsm-vps-bootstrap.sh
+```
+
 ## What This Is
 
 This repository is intentionally not the Docker hosting stack and not the Codex
