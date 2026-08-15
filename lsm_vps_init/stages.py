@@ -839,7 +839,7 @@ def run_sadmin_ssh_key(ctx: Context) -> StageResult:
 def _effective_ssh_ports(ctx: Context) -> set[str]:
     if ctx.layout.mock_root and ctx.layout.ssh_dropin.exists():
         return set(re.findall(r"(?mi)^Port\s+(\d+)\s*$", ctx.layout.ssh_dropin.read_text(encoding="utf-8")))
-    result = ctx.runner.run(["sshd", "-T"], check=False)
+    result = run_privileged_system_command(ctx, ["sshd", "-T"], check=False)
     return set(re.findall(r"(?mi)^port\s+(\d+)\s*$", result.stdout))
 
 
@@ -864,8 +864,47 @@ def reload_ssh(ctx: Context) -> None:
             ctx.runner.run(["systemctl", "restart", "ssh"])
 
 
+def privileged_system_args(args: list[str]) -> list[str]:
+    return ["sudo", "-n", *args]
+
+
+def run_privileged_system_command(ctx: Context, args: list[str], **kwargs):
+    return ctx.runner.run(privileged_system_args(args), **kwargs)
+
+
+def sshd_test_config(ctx: Context) -> None:
+    run_privileged_system_command(ctx, ["sshd", "-t"])
+
+
+def sshd_global_effective_config(ctx: Context, *, check: bool = True):
+    return run_privileged_system_command(ctx, ["sshd", "-T"], check=check)
+
+
+def sshd_effective_for_sadmin_result(ctx: Context, *, check: bool = True):
+    return run_privileged_system_command(ctx, ["sshd", "-T", "-C", SSHD_SADMIN_MATCH_CRITERIA], check=check)
+
+
 def sshd_effective_for_sadmin(ctx: Context) -> str:
-    return ctx.runner.run(["sshd", "-T", "-C", SSHD_SADMIN_MATCH_CRITERIA]).stdout
+    return sshd_effective_for_sadmin_result(ctx).stdout
+
+
+def validate_final_sshd_effective_config(global_effective: str, sadmin_effective: str) -> None:
+    ports = set(re.findall(r"(?mi)^port\s+(\d+)\s*$", global_effective))
+    issues: list[str] = []
+    if SSH_PORT not in ports:
+        issues.append(f"port {SSH_PORT} is not enabled")
+    if "22" in ports:
+        issues.append("port 22 is still enabled")
+    if not re.search(r"(?mi)^permitrootlogin\s+no$", global_effective):
+        issues.append("PermitRootLogin is not no")
+    if not re.search(r"(?mi)^passwordauthentication\s+no$", global_effective):
+        issues.append("PasswordAuthentication is not no")
+    if not re.search(r"(?mi)^pubkeyauthentication\s+yes$", global_effective):
+        issues.append("PubkeyAuthentication is not yes")
+    if re.search(r"(?mi)^exposeauthinfo\s+yes$", sadmin_effective):
+        issues.append("ExposeAuthInfo remains enabled for sadmin")
+    if issues:
+        raise Failed("Final sshd effective configuration is not hardened: " + "; ".join(issues))
 
 
 def ssh_listener_present(ctx: Context, port: str) -> bool:
@@ -883,11 +922,11 @@ def run_ssh_dual_port(ctx: Context) -> StageResult:
         return StageResult("completed", "Would configure SSH to listen on ports 22 and 65500.", {"ports": ["22", SSH_PORT]})
     if not ctx.dry_run:
         backup_ssh_config(ctx)
-        ctx.runner.run(["sshd", "-t"])
+        sshd_test_config(ctx)
     secure_write(ctx.layout.ssh_dropin, plan, 0o644)
     if not ctx.dry_run:
-        ctx.runner.run(["sshd", "-t"])
-        ctx.runner.run(["sshd", "-T"])
+        sshd_test_config(ctx)
+        sshd_global_effective_config(ctx)
         effective_sadmin = sshd_effective_for_sadmin(ctx)
         if not re.search(r"(?mi)^exposeauthinfo\s+yes$", effective_sadmin):
             raise Failed("OpenSSH ExposeAuthInfo is not effective for sadmin; cannot prove public-key checkpoint.")
@@ -1710,17 +1749,18 @@ def run_discord_relay_checkpoint(ctx: Context) -> StageResult:
 def detect_final_host_hardening(ctx: Context) -> bool:
     if ctx.dry_run:
         return detected_stage_by_state(ctx, "final_host_hardening")
-    result = ctx.runner.run(["sshd", "-T"], check=False)
-    text = result.stdout
-    ports = set(re.findall(r"(?mi)^port\s+(\d+)\s*$", text))
-    sadmin_effective = ctx.runner.run(["sshd", "-T", "-C", SSHD_SADMIN_MATCH_CRITERIA], check=False).stdout
+    result = sshd_global_effective_config(ctx, check=False)
+    if result.returncode != 0:
+        return False
+    sadmin_result = sshd_effective_for_sadmin_result(ctx, check=False)
+    if sadmin_result.returncode != 0:
+        return False
+    try:
+        validate_final_sshd_effective_config(result.stdout, sadmin_result.stdout)
+    except Failed:
+        return False
     return (
-        SSH_PORT in ports
-        and "22" not in ports
-        and re.search(r"(?mi)^permitrootlogin\s+no$", text)
-        and re.search(r"(?mi)^passwordauthentication\s+no$", text)
-        and not re.search(r"(?mi)^exposeauthinfo\s+yes$", sadmin_effective)
-        and ctx.runner.run(["ufw", "status"], check=False).stdout.lower().find("active") >= 0
+        ctx.runner.run(["ufw", "status"], check=False).stdout.lower().find("active") >= 0
     )
 
 
@@ -1755,20 +1795,18 @@ def run_final_host_hardening(ctx: Context) -> StageResult:
         raise Blocked("Final hardening requires explicit operator confirmation.")
     if not ctx.dry_run:
         backup_ssh_config(ctx)
-        ctx.runner.run(["sshd", "-t"])
-        ctx.runner.run(["sshd", "-T"])
+        sshd_test_config(ctx)
+        sshd_global_effective_config(ctx)
         sshd_effective_for_sadmin(ctx)
     secure_write(ctx.layout.ssh_dropin, render_ssh_dropin("hardened"), 0o644)
     if not ctx.dry_run:
-        ctx.runner.run(["sshd", "-t"])
-        ctx.runner.run(["sshd", "-T"])
+        sshd_test_config(ctx)
+        hardened_global = sshd_global_effective_config(ctx).stdout
         hardened_sadmin = sshd_effective_for_sadmin(ctx)
-        if re.search(r"(?mi)^exposeauthinfo\s+yes$", hardened_sadmin):
-            raise Failed("OpenSSH ExposeAuthInfo remained enabled for sadmin after final hardening.")
+        validate_final_sshd_effective_config(hardened_global, hardened_sadmin)
         reload_ssh(ctx)
         hardened_after_reload = sshd_effective_for_sadmin(ctx)
-        if re.search(r"(?mi)^exposeauthinfo\s+yes$", hardened_after_reload):
-            raise Failed("OpenSSH ExposeAuthInfo remained enabled for sadmin after SSH reload.")
+        validate_final_sshd_effective_config(sshd_global_effective_config(ctx).stdout, hardened_after_reload)
         ctx.runner.run(["apt-get", "install", "-y", "ufw", "fail2ban", "unattended-upgrades"])
         ctx.runner.run(["ufw", "default", "deny", "incoming"])
         ctx.runner.run(["ufw", "default", "allow", "outgoing"])
