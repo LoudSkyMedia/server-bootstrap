@@ -305,16 +305,18 @@ relay configuration, or application/container env files.
 The working repository name remains `server-bootstrap`; the recommended public
 remote is `LoudSkyMedia/server-bootstrap`.
 
-Production usage should not depend on mutable `main`. Release process:
+Long-term production usage should not depend exclusively on mutable `main`.
+Initial public publication uses `main` until `stable` or immutable tags exist.
+Release process:
 
-1. Publish reviewed immutable tags such as `v0.1.0`.
+1. Publish reviewed immutable tags such as `vX.Y.Z`.
 2. Attach an archive checksum manifest and, ideally, a signed release
    attestation.
 3. Maintain a convenience bootstrap URL that resolves to the current stable
-   release, not unreviewed `main`.
+   release, not unaccepted `main` work.
 4. Document a pinned form using `LSM_VPS_INIT_REF=vX.Y.Z` and
    `LSM_VPS_INIT_SHA256=<sha256>` for reproducible installs.
-5. Keep `main` suitable for review/testing only until a release is cut.
+5. Advance `stable` only after an accepted revision is selected.
 
 ## Module Contract
 

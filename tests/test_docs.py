@@ -11,6 +11,12 @@ class DocsTests(unittest.TestCase):
         self.assertIn("sudo lsm-vps-init resume", readme)
         self.assertIn("LSM_VPS_INIT_SHA256", readme)
         self.assertIn("curl -fsSL", readme)
+        self.assertIn("Before You Start", readme)
+        self.assertIn("Paste sadmin SSH public key", readme)
+        self.assertIn("DISCORD_BOT_TOKEN", readme)
+        self.assertIn("CADDY_ACME_EMAIL", readme)
+        self.assertNotIn("/stable/bootstrap.sh", readme)
+        self.assertNotIn("/v0.1.0/bootstrap.sh", readme)
 
     def test_architecture_names_all_stages(self):
         arch = (ROOT / "docs" / "architecture.md").read_text(encoding="utf-8")
@@ -38,9 +44,16 @@ class DocsTests(unittest.TestCase):
     def test_release_trust_documents_stable_and_pinned_channels(self):
         release = (ROOT / "docs" / "release-trust.md").read_text(encoding="utf-8")
         self.assertIn("stable", release)
-        self.assertIn("v0.1.0", release)
+        self.assertIn("vX.Y.Z", release)
         self.assertIn("LSM_VPS_INIT_SHA256", release)
         self.assertIn("checksum", release.lower())
+        self.assertNotIn("/stable/bootstrap.sh", release)
+        self.assertNotIn("/v0.1.0/bootstrap.sh", release)
+
+    def test_bootstrap_default_ref_matches_current_public_channel(self):
+        bootstrap = (ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+        self.assertIn('DEFAULT_REF="main"', bootstrap)
+        self.assertNotIn('DEFAULT_REF="stable"', bootstrap)
 
 
 if __name__ == "__main__":
