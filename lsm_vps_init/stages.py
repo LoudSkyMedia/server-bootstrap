@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -391,6 +392,53 @@ class Context:
             input_text=input_text,
             check=check,
             secret_stdin=secret_stdin,
+            timeout=timeout,
+        )
+
+    def sadmin_uid(self) -> str:
+        result = self.runner.run(["id", "-u", "sadmin"], check=False)
+        if result.returncode != 0:
+            raise Failed("Unable to resolve sadmin UID for user systemd operations.")
+        uid = result.stdout.strip()
+        if not re.fullmatch(r"[0-9]+", uid):
+            raise Failed("Resolved sadmin UID was not numeric.")
+        return uid
+
+    def sadmin_systemd_env(self, uid: str | None = None) -> dict[str, str]:
+        resolved_uid = uid or self.sadmin_uid()
+        return {
+            "XDG_RUNTIME_DIR": f"/run/user/{resolved_uid}",
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{resolved_uid}/bus",
+        }
+
+    def sadmin_user_systemd_shell(
+        self,
+        script: str,
+        *,
+        check: bool = True,
+        timeout: int | None = None,
+        uid: str | None = None,
+    ):
+        env = self.sadmin_systemd_env(uid)
+        wrapped = (
+            'export HOME=/home/sadmin; '
+            'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"; '
+            f"{script}"
+        )
+        return self.runner.run(
+            [
+                "sudo",
+                "-u",
+                "sadmin",
+                "-H",
+                "env",
+                f"XDG_RUNTIME_DIR={env['XDG_RUNTIME_DIR']}",
+                f"DBUS_SESSION_BUS_ADDRESS={env['DBUS_SESSION_BUS_ADDRESS']}",
+                "bash",
+                "-lc",
+                wrapped,
+            ],
+            check=check,
             timeout=timeout,
         )
 
@@ -1264,12 +1312,14 @@ def detect_discord_relay_install(ctx: Context) -> bool:
     if not env_path.exists() or not config_path.exists():
         return False
     try:
-        env_values = relay_env_values_from_text(env_path.read_text(encoding="utf-8", errors="replace"), RELAY_CONTRACT_KEYS)
+        _, env_values = read_trusted_existing_relay_env_values(ctx, env_path)
         validate_relay_env_policy(env_values)
         validate_relay_codex_contract(env_values, config_path.read_text(encoding="utf-8", errors="replace"))
-    except (Blocked, ValueError):
+        if not relay_existing_values_are_complete(ctx, env_values):
+            return False
+    except (Blocked, Failed, ValueError):
         return False
-    return ctx.sadmin_shell(
+    return ctx.sadmin_user_systemd_shell(
         "test -d /home/sadmin/codex-vps-discord-relay/.git "
         "&& cd /home/sadmin/codex-vps-discord-relay "
         "&& npm run preflight >/dev/null "
@@ -1279,9 +1329,9 @@ def detect_discord_relay_install(ctx: Context) -> bool:
     ).returncode == 0
 
 
-def _relay_env_updates(ctx: Context) -> dict[str, str]:
+def _relay_env_defaults(ctx: Context) -> dict[str, str]:
     session_id = ctx.state.get("facts", {}).get("codex_session_id", "")
-    defaults = {
+    return {
         "CODEX_VPS_DEFAULT_SESSION_ID": session_id,
         "CODEX_VPS_ROOT": "/home/sadmin",
         "CODEX_VPS_DEFAULT_SESSION_KEY": "vps",
@@ -1292,6 +1342,106 @@ def _relay_env_updates(ctx: Context) -> dict[str, str]:
         "CODEX_VPS_ENGINE": "exec",
         "CODEX_VPS_ROUTE_UNMAPPED_TO_DEFAULT": "true",
     }
+
+
+def relay_env_prompt_keys() -> tuple[str, ...]:
+    return (
+        "DISCORD_BOT_TOKEN",
+        "DISCORD_GUILD_ID",
+        "CODEX_VPS_DEFAULT_CHANNEL_ID",
+        "CODEX_VPS_DEFAULT_SESSION_ID",
+        "CODEX_VPS_ALLOWED_USER_IDS",
+        "CODEX_VPS_ALLOWED_APPROVER_USER_IDS",
+    )
+
+
+RELAY_DEFAULT_ENV_KEYS = (
+    "CODEX_VPS_DEFAULT_SESSION_ID",
+    "CODEX_VPS_ROOT",
+    "CODEX_VPS_DEFAULT_SESSION_KEY",
+    "CODEX_VPS_DEFAULT_SESSION_LABEL",
+    "CODEX_VPS_BYPASS_APPROVALS_AND_SANDBOX",
+    "CODEX_VPS_BYPASS_HOOK_TRUST",
+    "CODEX_VPS_SKIP_GIT_REPO_CHECK",
+    "CODEX_VPS_ENGINE",
+    "CODEX_VPS_ROUTE_UNMAPPED_TO_DEFAULT",
+)
+
+
+def relay_env_managed_keys() -> list[str]:
+    return list(dict.fromkeys([*relay_env_prompt_keys(), *RELAY_DEFAULT_ENV_KEYS]))
+
+
+def relay_existing_env_trust_error(ctx: Context, env_path: Path) -> str | None:
+    if not os.path.lexists(env_path):
+        return None
+    try:
+        link_stat = env_path.lstat()
+    except OSError:
+        return "cannot stat existing relay .env"
+    if not stat.S_ISREG(link_stat.st_mode):
+        return "existing relay .env is not a regular file"
+    mode = stat.S_IMODE(link_stat.st_mode)
+    if mode != 0o600:
+        return "existing relay .env must be mode 0600"
+    uid = int(ctx.sadmin_uid())
+    if link_stat.st_uid != uid:
+        return "existing relay .env must be owned by sadmin"
+    return None
+
+
+def relay_env_values_from_existing_text(text: str, keys: list[str]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for key in keys:
+        try:
+            values[key] = parse_env_value(text, key) or ""
+        except ValueError:
+            values[key] = ""
+    return values
+
+
+def read_trusted_existing_relay_env_values(ctx: Context, env_path: Path) -> tuple[str, dict[str, str]]:
+    if not os.path.lexists(env_path):
+        return "", {}
+    trust_error = relay_existing_env_trust_error(ctx, env_path)
+    if trust_error:
+        raise Blocked(f"Existing relay .env is not safe to reuse: {trust_error}. Fix it or move it aside, then resume.")
+    existing = env_path.read_text(encoding="utf-8")
+    return existing, relay_env_values_from_existing_text(existing, relay_env_managed_keys())
+
+
+def relay_existing_value_valid(ctx: Context, key: str, value: str) -> bool:
+    if key == "DISCORD_BOT_TOKEN":
+        return bool(value)
+    if key in {"DISCORD_GUILD_ID", "CODEX_VPS_DEFAULT_CHANNEL_ID"}:
+        try:
+            validate_discord_id(value, key)
+            return True
+        except Blocked:
+            return False
+    if key == "CODEX_VPS_ALLOWED_USER_IDS":
+        try:
+            validate_discord_id_list(value, key, required=True)
+            return True
+        except Blocked:
+            return False
+    if key == "CODEX_VPS_ALLOWED_APPROVER_USER_IDS":
+        try:
+            validate_discord_id_list(value, key, required=False)
+            return bool(value.strip()) or bool(ctx.state.get("facts", {}).get("relay_no_remote_approval_authority"))
+        except Blocked:
+            return False
+    if key == "CODEX_VPS_DEFAULT_SESSION_ID":
+        return bool(value)
+    return bool(value)
+
+
+def relay_existing_values_are_complete(ctx: Context, values: dict[str, str]) -> bool:
+    return all(relay_existing_value_valid(ctx, key, values.get(key, "")) for key in relay_env_prompt_keys())
+
+
+def _relay_env_updates(ctx: Context, existing_values: dict[str, str] | None = None) -> dict[str, str]:
+    defaults = _relay_env_defaults(ctx)
     if ctx.dry_run:
         updates = {
             **defaults,
@@ -1303,18 +1453,37 @@ def _relay_env_updates(ctx: Context) -> dict[str, str]:
         }
         validate_relay_env_policy(updates)
         return updates
+    existing_values = existing_values or {}
     updates = dict(defaults)
-    updates["DISCORD_BOT_TOKEN"] = ctx.prompt_secret("Discord bot token", confirm=False)
-    updates["DISCORD_GUILD_ID"] = ctx.prompt_text("Discord server/guild ID")
-    updates["CODEX_VPS_DEFAULT_CHANNEL_ID"] = ctx.prompt_text("Discord channel ID for the VPS session")
-    updates["CODEX_VPS_DEFAULT_SESSION_ID"] = ctx.prompt_text("Codex VPS default session ID", default=session_id)
-    updates["CODEX_VPS_ALLOWED_USER_IDS"] = ctx.prompt_text("Comma-separated allowed Discord user IDs")
-    approvers = ctx.prompt_text("Comma-separated allowed Discord approver user IDs", required=False)
-    if not approvers:
-        if not ctx.confirm("No human approver ACL means Plan/sensitive approvals cannot be granted through Discord. Continue with no-approval setup?", default=False):
-            raise Blocked("At least one CODEX_VPS_ALLOWED_APPROVER_USER_IDS value is required unless no-approval setup is explicitly selected.")
-        set_fact(ctx.state, "relay_no_remote_approval_authority", True)
-    updates["CODEX_VPS_ALLOWED_APPROVER_USER_IDS"] = approvers
+    if relay_existing_value_valid(ctx, "DISCORD_BOT_TOKEN", existing_values.get("DISCORD_BOT_TOKEN", "")):
+        updates["DISCORD_BOT_TOKEN"] = existing_values["DISCORD_BOT_TOKEN"]
+    else:
+        updates["DISCORD_BOT_TOKEN"] = ctx.prompt_secret("Discord bot token", confirm=False)
+    if relay_existing_value_valid(ctx, "DISCORD_GUILD_ID", existing_values.get("DISCORD_GUILD_ID", "")):
+        updates["DISCORD_GUILD_ID"] = existing_values["DISCORD_GUILD_ID"]
+    else:
+        updates["DISCORD_GUILD_ID"] = ctx.prompt_text("Discord server/guild ID")
+    if relay_existing_value_valid(ctx, "CODEX_VPS_DEFAULT_CHANNEL_ID", existing_values.get("CODEX_VPS_DEFAULT_CHANNEL_ID", "")):
+        updates["CODEX_VPS_DEFAULT_CHANNEL_ID"] = existing_values["CODEX_VPS_DEFAULT_CHANNEL_ID"]
+    else:
+        updates["CODEX_VPS_DEFAULT_CHANNEL_ID"] = ctx.prompt_text("Discord channel ID for the VPS session")
+    if relay_existing_value_valid(ctx, "CODEX_VPS_DEFAULT_SESSION_ID", existing_values.get("CODEX_VPS_DEFAULT_SESSION_ID", "")):
+        updates["CODEX_VPS_DEFAULT_SESSION_ID"] = existing_values["CODEX_VPS_DEFAULT_SESSION_ID"]
+    else:
+        updates["CODEX_VPS_DEFAULT_SESSION_ID"] = ctx.prompt_text("Codex VPS default session ID", default=defaults["CODEX_VPS_DEFAULT_SESSION_ID"])
+    if relay_existing_value_valid(ctx, "CODEX_VPS_ALLOWED_USER_IDS", existing_values.get("CODEX_VPS_ALLOWED_USER_IDS", "")):
+        updates["CODEX_VPS_ALLOWED_USER_IDS"] = existing_values["CODEX_VPS_ALLOWED_USER_IDS"]
+    else:
+        updates["CODEX_VPS_ALLOWED_USER_IDS"] = ctx.prompt_text("Comma-separated allowed Discord user IDs")
+    if relay_existing_value_valid(ctx, "CODEX_VPS_ALLOWED_APPROVER_USER_IDS", existing_values.get("CODEX_VPS_ALLOWED_APPROVER_USER_IDS", "")):
+        updates["CODEX_VPS_ALLOWED_APPROVER_USER_IDS"] = existing_values.get("CODEX_VPS_ALLOWED_APPROVER_USER_IDS", "")
+    else:
+        approvers = ctx.prompt_text("Comma-separated allowed Discord approver user IDs", required=False)
+        if not approvers:
+            if not ctx.confirm("No human approver ACL means Plan/sensitive approvals cannot be granted through Discord. Continue with no-approval setup?", default=False):
+                raise Blocked("At least one CODEX_VPS_ALLOWED_APPROVER_USER_IDS value is required unless no-approval setup is explicitly selected.")
+            set_fact(ctx.state, "relay_no_remote_approval_authority", True)
+        updates["CODEX_VPS_ALLOWED_APPROVER_USER_IDS"] = approvers
     validate_relay_env_policy(updates)
     return updates
 
@@ -1423,6 +1592,27 @@ def ensure_relay_native_build_prerequisites(ctx: Context) -> None:
         )
 
 
+def prepare_sadmin_user_manager(ctx: Context) -> str:
+    uid = ctx.sadmin_uid()
+    ctx.runner.run(["loginctl", "enable-linger", "sadmin"])
+    ctx.runner.run(["systemctl", "start", f"user@{uid}.service"], check=False, timeout=120)
+    verify = ctx.sadmin_user_systemd_shell(
+        'test -d "$XDG_RUNTIME_DIR" '
+        '&& test -S "$XDG_RUNTIME_DIR/bus" '
+        "&& systemctl --user is-system-running >/dev/null",
+        check=False,
+        timeout=120,
+        uid=uid,
+    )
+    if verify.returncode != 0:
+        raise Failed(
+            "sadmin user systemd manager is not reachable through the expected runtime bus. "
+            f"Expected XDG_RUNTIME_DIR=/run/user/{uid} and DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus. "
+            "Review logind/user@ service state, then resume with `sudo lsm-vps-init resume`."
+        )
+    return uid
+
+
 def relay_native_build_failure_hint(result) -> str | None:
     text = f"{result.stdout}\n{result.stderr}".lower()
     markers = ("node-gyp", "gyp err", "no prebuilt binary", "not found: make", "better-sqlite3")
@@ -1452,8 +1642,8 @@ def run_discord_relay_install(ctx: Context) -> StageResult:
     else:
         repo_path.mkdir(parents=True, exist_ok=True)
     env_path = repo_path / ".env"
-    existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
-    updates = _relay_env_updates(ctx)
+    existing, existing_values = read_trusted_existing_relay_env_values(ctx, env_path)
+    updates = _relay_env_updates(ctx, existing_values)
     if not updates.get("CODEX_VPS_ALLOWED_USER_IDS"):
         raise Blocked("CODEX_VPS_ALLOWED_USER_IDS must not be empty for this privileged bootstrap.")
     config_path = ctx.layout.sadmin_home / ".codex" / "config.toml"
@@ -1464,20 +1654,20 @@ def run_discord_relay_install(ctx: Context) -> StageResult:
     secure_write(env_path, merge_env_text(existing, updates), 0o600)
     if not ctx.dry_run:
         ctx.runner.run(["chown", "sadmin:sadmin", "/home/sadmin/codex-vps-discord-relay/.env"])
+        uid = prepare_sadmin_user_manager(ctx)
         ensure_relay_native_build_prerequisites(ctx)
         ctx.sadmin_shell("cd /home/sadmin/codex-vps-discord-relay && chmod +x bin/*.sh bin/preflight.js bin/codex-vps-relay hooks/codex_vps_notify.py")
         try:
-            ctx.sadmin_shell("cd /home/sadmin/codex-vps-discord-relay && bin/install-service.sh", timeout=1800)
+            ctx.sadmin_user_systemd_shell("cd /home/sadmin/codex-vps-discord-relay && bin/install-service.sh", timeout=1800, uid=uid)
         except CommandError as error:
             hint = relay_native_build_failure_hint(error.result)
             if hint:
                 raise Failed(hint) from error
             raise
         ctx.sadmin_shell("cd /home/sadmin/codex-vps-discord-relay && bin/install-hook.sh", timeout=300)
-        ctx.runner.run(["loginctl", "enable-linger", "sadmin"])
-        ctx.sadmin_shell("cd /home/sadmin/codex-vps-discord-relay && npm run preflight", timeout=300)
+        ctx.sadmin_user_systemd_shell("cd /home/sadmin/codex-vps-discord-relay && npm run preflight", timeout=300, uid=uid)
         verify_codex_config_defaults(ctx)
-        ctx.sadmin_shell("systemctl --user is-active --quiet codex-vps-discord-relay.service")
+        ctx.sadmin_user_systemd_shell("systemctl --user is-active --quiet codex-vps-discord-relay.service", uid=uid)
     return StageResult("completed", "Discord relay repository is installed and delegated preflight/service checks passed.")
 
 
