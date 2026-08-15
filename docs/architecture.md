@@ -98,7 +98,7 @@ arguments.
 | 13 | `discord_relay_install` | Clone/update relay, configure `.env`, run repo-owned install/preflight/hooks/tests | Blocks on relay preflight/service failure |
 | 14 | `discord_relay_checkpoint` | Require real Discord -> relay -> Codex -> Discord round trip | Hard manual checkpoint |
 | 15 | `final_host_hardening` | Disable root/password SSH, remove `22`, configure UFW/fail2ban/unattended upgrades | Requires live revalidation of both recovery paths |
-| 16 | `docker_hosting_stack` | Clone/update hosting stack and hand off to selected dry-run/runbook workflows | Blocks on missing capability decisions |
+| 16 | `docker_hosting_stack` | Clone/update hosting stack, hydrate protected repo `.env`, and hand off to selected dry-run/runbook workflows | Blocks on missing capability decisions or unsafe env boundaries |
 
 ## Idempotency Model
 
@@ -282,6 +282,14 @@ spaces, tabs, shell metacharacters, quotes, `#`, `=`, backslashes, backticks,
 parentheses, and exclamation marks are supported as single-line values. NUL,
 newline, and carriage return are rejected because they cannot be safely
 represented in the chosen single-line format.
+
+When the Docker Hosting Stack module is selected, `/home/sadmin/.env` remains
+the source of truth for `SUDO_PASSWORD`. The bootstrap deliberately parses it,
+verifies protected file ownership and mode, and writes the same value into the
+protected ignored `/home/sadmin/docker-hosting-stack/.env` so the stack's own
+stdin-based sudo helper works in a fresh noninteractive `sadmin` process. This
+handoff must not place the value in bootstrap state, logs, command arguments,
+relay configuration, or application/container env files.
 
 ## Release Trust
 

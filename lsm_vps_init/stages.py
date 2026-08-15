@@ -16,6 +16,7 @@ from typing import Any, Callable
 from .state import mark_reboot_pending, select_module, set_checkpoint, set_fact, set_stage, utc_now
 from .util import (
     CommandError,
+    CommandResult,
     CommandRunner,
     DEFAULT_BIN_PATH,
     PathLayout,
@@ -43,13 +44,15 @@ CODEX_WORK_ROOT = "/home/sadmin"
 SSHD_SADMIN_MATCH_CRITERIA = f"user=sadmin,host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport={SSH_PORT}"
 DOCKER_HOSTING_REPO = "/home/sadmin/docker-hosting-stack"
 DOCKER_HOSTING_MODES = {"base", "standalone-app", "n8n", "website-migration"}
-DOCKER_N8N_REQUIRED_ENV_KEYS = (
+DOCKER_N8N_PROVISIONING_ENV_KEYS = (
     "CADDY_ACME_EMAIL",
     "CF_ACCOUNT_ID",
     "CF_API_TOKEN",
     "N8N_HOSTNAME",
 )
-DOCKER_HOSTING_SECRET_ENV_KEYS = {"CF_API_TOKEN"}
+DOCKER_HOSTING_MANAGED_ENV_KEYS = (*DOCKER_N8N_PROVISIONING_ENV_KEYS, "SUDO_PASSWORD")
+DOCKER_N8N_REQUIRED_ENV_KEYS = DOCKER_N8N_PROVISIONING_ENV_KEYS
+DOCKER_HOSTING_SECRET_ENV_KEYS = ("CF_API_TOKEN", "SUDO_PASSWORD")
 NODEJS_RELEASE_KEY_FINGERPRINTS = (
     "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356",
     "DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7",
@@ -1897,22 +1900,35 @@ def detect_docker_hosting_stack(ctx: Context) -> bool:
     return Path(DOCKER_HOSTING_REPO, ".git").exists()
 
 
-def docker_existing_env_trust_error(ctx: Context, env_path: Path) -> str | None:
+def protected_sadmin_env_file_trust_error(
+    ctx: Context,
+    env_path: Path,
+    label: str,
+    *,
+    required: bool = False,
+    uid: int | None = None,
+) -> str | None:
     if not os.path.lexists(env_path):
+        if required:
+            return f"{label} is missing"
         return None
     try:
         link_stat = env_path.lstat()
     except OSError:
-        return "cannot stat existing Docker Hosting Stack .env"
+        return f"cannot stat {label}"
     if not stat.S_ISREG(link_stat.st_mode):
-        return "existing Docker Hosting Stack .env is not a regular file"
+        return f"{label} is not a regular file"
     mode = stat.S_IMODE(link_stat.st_mode)
     if mode != 0o600:
-        return "existing Docker Hosting Stack .env must be mode 0600"
-    uid = int(ctx.sadmin_uid())
-    if link_stat.st_uid != uid:
-        return "existing Docker Hosting Stack .env must be owned by sadmin"
+        return f"{label} must be mode 0600"
+    expected_uid = uid if uid is not None else int(ctx.sadmin_uid())
+    if link_stat.st_uid != expected_uid:
+        return f"{label} must be owned by sadmin"
     return None
+
+
+def docker_existing_env_trust_error(ctx: Context, env_path: Path, *, uid: int | None = None) -> str | None:
+    return protected_sadmin_env_file_trust_error(ctx, env_path, "existing Docker Hosting Stack .env", uid=uid)
 
 
 def docker_env_values_from_existing_text(text: str, keys: tuple[str, ...]) -> dict[str, str]:
@@ -1925,14 +1941,14 @@ def docker_env_values_from_existing_text(text: str, keys: tuple[str, ...]) -> di
     return values
 
 
-def read_trusted_existing_docker_env_values(ctx: Context, env_path: Path) -> tuple[str, dict[str, str]]:
+def read_trusted_existing_docker_env_values(ctx: Context, env_path: Path, *, uid: int | None = None) -> tuple[str, dict[str, str]]:
     if not os.path.lexists(env_path):
         return "", {}
-    trust_error = docker_existing_env_trust_error(ctx, env_path)
+    trust_error = docker_existing_env_trust_error(ctx, env_path, uid=uid)
     if trust_error:
         raise Blocked(f"Existing Docker Hosting Stack .env is not safe to reuse: {trust_error}. Fix it or move it aside, then resume.")
     existing = env_path.read_text(encoding="utf-8")
-    return existing, docker_env_values_from_existing_text(existing, DOCKER_N8N_REQUIRED_ENV_KEYS)
+    return existing, docker_env_values_from_existing_text(existing, DOCKER_HOSTING_MANAGED_ENV_KEYS)
 
 
 def _single_line_value(value: str) -> bool:
@@ -1942,6 +1958,8 @@ def _single_line_value(value: str) -> bool:
 def validate_docker_n8n_env_value(key: str, value: str) -> bool:
     if not _single_line_value(value):
         return False
+    if key == "SUDO_PASSWORD":
+        return True
     if key == "CADDY_ACME_EMAIL":
         return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value.strip()))
     if key == "CF_ACCOUNT_ID":
@@ -1972,6 +1990,8 @@ def _prompt_docker_n8n_value(ctx: Context, key: str) -> str:
         value = ctx.prompt_secret("Cloudflare API token", confirm=False)
     elif key == "N8N_HOSTNAME":
         value = ctx.prompt_text("n8n public hostname")
+    elif key == "SUDO_PASSWORD":
+        raise AssertionError("SUDO_PASSWORD is copied from /home/sadmin/.env, not prompted")
     else:
         value = ctx.prompt_text(key)
     if not validate_docker_n8n_env_value(key, value):
@@ -1981,19 +2001,51 @@ def _prompt_docker_n8n_value(ctx: Context, key: str) -> str:
 
 def docker_n8n_env_updates(ctx: Context, existing_values: dict[str, str]) -> dict[str, str]:
     updates: dict[str, str] = {}
-    for key in DOCKER_N8N_REQUIRED_ENV_KEYS:
+    for key in DOCKER_N8N_PROVISIONING_ENV_KEYS:
         if docker_existing_value_valid(key, existing_values.get(key, "")):
             continue
         updates[key] = _prompt_docker_n8n_value(ctx, key)
     return updates
 
 
+def read_sadmin_sudo_password(ctx: Context, uid: int) -> str:
+    trust_error = protected_sadmin_env_file_trust_error(
+        ctx,
+        ctx.layout.sadmin_env,
+        "sadmin .env",
+        required=True,
+        uid=uid,
+    )
+    if trust_error:
+        raise Blocked(f"Cannot safely read approved sadmin sudo credential: {trust_error}. Fix /home/sadmin/.env, then resume.")
+    try:
+        text = ctx.layout.sadmin_env.read_text(encoding="utf-8")
+    except OSError as error:
+        raise Blocked("Cannot safely read approved sadmin sudo credential. Fix /home/sadmin/.env, then resume.") from error
+    try:
+        sudo_password = parse_env_value(text, "SUDO_PASSWORD") or ""
+    except ValueError as error:
+        raise Blocked("Cannot parse SUDO_PASSWORD from /home/sadmin/.env safely. Fix the protected file, then resume.") from error
+    if not docker_existing_value_valid("SUDO_PASSWORD", sudo_password):
+        raise Blocked("SUDO_PASSWORD is missing or unsafe in /home/sadmin/.env. Fix the protected file, then resume.")
+    return sudo_password
+
+
+def docker_hosting_env_updates(ctx: Context, mode: str, existing_values: dict[str, str], sudo_password: str) -> dict[str, str]:
+    updates: dict[str, str] = {}
+    if existing_values.get("SUDO_PASSWORD") != sudo_password:
+        updates["SUDO_PASSWORD"] = sudo_password
+    if mode == "n8n":
+        updates.update(docker_n8n_env_updates(ctx, existing_values))
+    return updates
+
+
 def ensure_docker_hosting_env(ctx: Context, repo_path: Path, mode: str) -> dict[str, str]:
-    if mode != "n8n":
-        return {}
     env_path = repo_path / ".env"
-    existing, existing_values = read_trusted_existing_docker_env_values(ctx, env_path)
-    updates = docker_n8n_env_updates(ctx, existing_values)
+    uid = int(ctx.sadmin_uid())
+    sudo_password = read_sadmin_sudo_password(ctx, uid)
+    existing, existing_values = read_trusted_existing_docker_env_values(ctx, env_path, uid=uid)
+    updates = docker_hosting_env_updates(ctx, mode, existing_values, sudo_password)
     merged_values = {**existing_values, **updates}
     if not updates:
         return merged_values
@@ -2004,6 +2056,22 @@ def ensure_docker_hosting_env(ctx: Context, repo_path: Path, mode: str) -> dict[
     if not ctx.dry_run:
         ctx.runner.run(["chown", "sadmin:sadmin", f"{DOCKER_HOSTING_REPO}/.env"])
     return merged_values
+
+
+def docker_hosting_validation_failure_message(mode: str, validation: CommandResult) -> str:
+    output = f"{validation.stdout}\n{validation.stderr}".lower()
+    if "sudo_password" in output or "passwordless sudo" in output:
+        return (
+            "Docker Hosting Stack validation failed because the protected hosting-stack .env did not provide a usable sudo credential. "
+            "server-bootstrap hydrates SUDO_PASSWORD from /home/sadmin/.env; verify both protected .env files are regular files, "
+            "owned by sadmin, mode 0600, and resume with `sudo lsm-vps-init resume`."
+        )
+    if mode == "n8n" and ("cloudflare" in output or "cf_account_id" in output or "cf_api_token" in output):
+        return (
+            "Docker Hosting Stack n8n validation failed after bootstrap collected required values. "
+            "Check Cloudflare account ID/token permissions and N8N_HOSTNAME DNS readiness, then resume with `sudo lsm-vps-init resume`."
+        )
+    return "Docker Hosting Stack .env validation failed. Review the repo validator output, fix configuration, then resume with `sudo lsm-vps-init resume`."
 
 
 def run_docker_hosting_stack(ctx: Context) -> StageResult:
@@ -2034,9 +2102,13 @@ def run_docker_hosting_stack(ctx: Context) -> StageResult:
     ctx.sadmin_shell("cd /home/sadmin/docker-hosting-stack && test -f .env || install -m 0600 .env.example .env")
     repo_path = ctx.layout.sadmin_home / "docker-hosting-stack"
     docker_env_values = ensure_docker_hosting_env(ctx, repo_path, mode)
-    ctx.sadmin_shell("cd /home/sadmin/docker-hosting-stack && scripts/audit_host_baseline.sh --output docs/instances/bootstrap/audits/host-baseline-$(date -u +%F).md", timeout=180)
     validation_mode = "n8n" if mode == "n8n" else "base"
     redactions = [docker_env_values[key] for key in DOCKER_HOSTING_SECRET_ENV_KEYS if docker_env_values.get(key)]
+    ctx.sadmin_shell(
+        "cd /home/sadmin/docker-hosting-stack && scripts/audit_host_baseline.sh --output docs/instances/bootstrap/audits/host-baseline-$(date -u +%F).md",
+        timeout=180,
+        redact_values=redactions,
+    )
     validation = ctx.sadmin_shell(
         f"cd /home/sadmin/docker-hosting-stack && scripts/validate_env.sh --mode {shlex.quote(validation_mode)}",
         check=False,
@@ -2044,16 +2116,11 @@ def run_docker_hosting_stack(ctx: Context) -> StageResult:
         redact_values=redactions,
     )
     if validation.returncode != 0:
-        if mode == "n8n":
-            raise Blocked(
-                "Docker Hosting Stack n8n validation failed after bootstrap collected required values. "
-                "Check Cloudflare account ID/token permissions and N8N_HOSTNAME DNS readiness, then resume with `sudo lsm-vps-init resume`."
-            )
-        raise Blocked("Docker Hosting Stack .env validation failed. Review the repo validator output, fix configuration, then resume.")
+        raise Blocked(docker_hosting_validation_failure_message(mode, validation))
     if mode == "n8n":
-        ctx.sadmin_shell("cd /home/sadmin/docker-hosting-stack && scripts/install_n8n.sh --dry-run", timeout=180)
+        ctx.sadmin_shell("cd /home/sadmin/docker-hosting-stack && scripts/install_n8n.sh --dry-run", timeout=180, redact_values=redactions)
     else:
-        ctx.sadmin_shell("cd /home/sadmin/docker-hosting-stack && scripts/bootstrap_layout.sh --dry-run", timeout=180)
+        ctx.sadmin_shell("cd /home/sadmin/docker-hosting-stack && scripts/bootstrap_layout.sh --dry-run", timeout=180, redact_values=redactions)
     return StageResult("completed", f"Docker Hosting Stack handoff dry-run completed for mode: {mode}.")
 
 

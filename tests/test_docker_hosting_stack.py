@@ -46,6 +46,7 @@ VALID_N8N_ENV = {
     "CF_API_TOKEN": "cf_api_token_placeholder_value",
     "N8N_HOSTNAME": "n8n.example.com",
 }
+VALID_SUDO_PASSWORD = " leading sudo\tplaceholder ' \" $ # = \\ ` ; () ! trailing "
 
 
 class PromptRecorder:
@@ -119,10 +120,19 @@ def write_docker_env(ctx, values, *, mode=0o600):
     return env_path
 
 
-def successful_fresh_n8n_commands():
+def write_home_env(ctx, password=VALID_SUDO_PASSWORD, *, mode=0o600):
+    env_path = ctx.layout.sadmin_env
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text(merge_env_text("", {"SUDO_PASSWORD": password}), encoding="utf-8")
+    os.chmod(env_path, mode)
+    return env_path
+
+
+def successful_fresh_n8n_commands(uid):
     return [
         (DOCKER_CLONE, ""),
         (DOCKER_ENSURE_ENV, ""),
+        (("id", "-u", "sadmin"), uid),
         (DOCKER_CHOWN_ENV, ""),
         (DOCKER_AUDIT, ""),
         (DOCKER_VALIDATE_N8N, ""),
@@ -143,7 +153,8 @@ def successful_existing_n8n_commands(uid):
 
 class DockerHostingStackTests(unittest.TestCase):
     def test_fresh_n8n_prompts_for_required_values_and_runs_validation_after_collection(self):
-        runner = ScriptedRunner(successful_fresh_n8n_commands())
+        uid = str(os.getuid())
+        runner = ScriptedRunner(successful_fresh_n8n_commands(uid))
         prompts = PromptRecorder(
             {
                 "Caddy ACME email for n8n HTTPS certificates": VALID_N8N_ENV["CADDY_ACME_EMAIL"],
@@ -154,6 +165,7 @@ class DockerHostingStackTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             ctx = make_context(tmp, runner)
+            write_home_env(ctx)
             prompts.attach(ctx)
             with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
                 os.environ,
@@ -172,6 +184,7 @@ class DockerHostingStackTests(unittest.TestCase):
         self.assertLess(runner.calls.index(DOCKER_CHOWN_ENV), runner.calls.index(DOCKER_VALIDATE_N8N))
         for key, value in VALID_N8N_ENV.items():
             self.assertEqual(parse_env_value(written, key), value)
+        self.assertEqual(parse_env_value(written, "SUDO_PASSWORD"), VALID_SUDO_PASSWORD)
         self.assertIsNone(parse_env_value(written, "CODEX_NOTIFY_WEBHOOK_URL"))
         self.assertIsNone(parse_env_value(written, "CODEX_NOTIFY_SHARED_SECRET"))
         self.assertIsNone(parse_env_value(written, "N8N_ENCRYPTION_KEY"))
@@ -182,7 +195,8 @@ class DockerHostingStackTests(unittest.TestCase):
         runner = ScriptedRunner(successful_existing_n8n_commands(uid))
         with tempfile.TemporaryDirectory() as tmp:
             ctx = make_context(tmp, runner)
-            env_path = write_docker_env(ctx, {**VALID_N8N_ENV, "UNRELATED_KEEP": "yes"})
+            write_home_env(ctx)
+            env_path = write_docker_env(ctx, {**VALID_N8N_ENV, "SUDO_PASSWORD": VALID_SUDO_PASSWORD, "UNRELATED_KEEP": "yes"})
             ctx.prompt_secret = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("secret prompted on resume"))
             ctx.prompt_text = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("text prompted on resume"))
             with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
@@ -195,6 +209,7 @@ class DockerHostingStackTests(unittest.TestCase):
 
         self.assertEqual(result.status, "completed")
         self.assertEqual(parse_env_value(written, "UNRELATED_KEEP"), "yes")
+        self.assertEqual(parse_env_value(written, "SUDO_PASSWORD"), VALID_SUDO_PASSWORD)
         self.assertEqual(runner.responses, [])
 
     def test_partial_env_prompts_selectively_preserves_unrelated_values_and_keeps_secrets_out_of_state_and_logs(self):
@@ -218,10 +233,12 @@ class DockerHostingStackTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             ctx = make_context(tmp, runner)
+            write_home_env(ctx)
             write_docker_env(
                 ctx,
                 {
                     "CF_ACCOUNT_ID": VALID_N8N_ENV["CF_ACCOUNT_ID"],
+                    "SUDO_PASSWORD": "",
                     "N8N_HOSTNAME": VALID_N8N_ENV["N8N_HOSTNAME"],
                     "UNRELATED_KEEP": "yes",
                 },
@@ -244,12 +261,23 @@ class DockerHostingStackTests(unittest.TestCase):
         self.assertEqual(prompts.secret_prompts, ["Cloudflare API token"])
         self.assertEqual(parse_env_value(written, "UNRELATED_KEEP"), "yes")
         self.assertEqual(parse_env_value(written, "CF_API_TOKEN"), VALID_N8N_ENV["CF_API_TOKEN"])
+        self.assertEqual(parse_env_value(written, "SUDO_PASSWORD"), VALID_SUDO_PASSWORD)
         self.assertNotIn(VALID_N8N_ENV["CF_API_TOKEN"], state_payload)
         self.assertNotIn("CF_API_TOKEN", state_payload)
         self.assertNotIn(VALID_N8N_ENV["CF_API_TOKEN"], call_payload)
         self.assertNotIn(VALID_N8N_ENV["CF_API_TOKEN"], log_payload)
+        self.assertNotIn(VALID_SUDO_PASSWORD, state_payload)
+        self.assertNotIn("SUDO_PASSWORD", state_payload)
+        self.assertNotIn(VALID_SUDO_PASSWORD, call_payload)
+        self.assertNotIn(VALID_SUDO_PASSWORD, log_payload)
+        audit_index = runner.calls.index(DOCKER_AUDIT)
         validation_index = runner.calls.index(DOCKER_VALIDATE_N8N)
-        self.assertEqual(runner.kwargs[validation_index]["redact_values"], [VALID_N8N_ENV["CF_API_TOKEN"]])
+        install_index = runner.calls.index(DOCKER_INSTALL_N8N_DRY_RUN)
+        expected_redactions = [VALID_N8N_ENV["CF_API_TOKEN"], VALID_SUDO_PASSWORD]
+        self.assertEqual(runner.kwargs[audit_index]["redact_values"], expected_redactions)
+        self.assertEqual(runner.kwargs[validation_index]["redact_values"], expected_redactions)
+        self.assertEqual(runner.kwargs[install_index]["redact_values"], expected_redactions)
+        self.assertFalse(any("sudo -n true" in " ".join(call) or "sudo -v" in " ".join(call) for call in runner.calls))
 
     def test_cloudflare_validation_failure_is_resumable_without_reprompting_valid_env(self):
         uid = str(os.getuid())
@@ -269,12 +297,14 @@ class DockerHostingStackTests(unittest.TestCase):
                     [
                         (DOCKER_CLONE, ""),
                         (DOCKER_ENSURE_ENV, ""),
+                        (("id", "-u", "sadmin"), uid),
                         (DOCKER_CHOWN_ENV, ""),
                         (DOCKER_AUDIT, ""),
                         (DOCKER_VALIDATE_N8N, failed_validation),
                     ]
                 ),
             )
+            write_home_env(first_ctx)
             prompts.attach(first_ctx)
             with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
                 os.environ,
@@ -301,10 +331,12 @@ class DockerHostingStackTests(unittest.TestCase):
         self.assertEqual(resume_runner.responses, [])
 
     def test_unsafe_env_permissions_are_rejected_before_reuse(self):
-        runner = ScriptedRunner([(DOCKER_CLONE, ""), (DOCKER_ENSURE_ENV, "")])
+        uid = str(os.getuid())
+        runner = ScriptedRunner([(DOCKER_CLONE, ""), (DOCKER_ENSURE_ENV, ""), (("id", "-u", "sadmin"), uid)])
         with tempfile.TemporaryDirectory() as tmp:
             ctx = make_context(tmp, runner)
-            write_docker_env(ctx, VALID_N8N_ENV, mode=0o644)
+            write_home_env(ctx)
+            write_docker_env(ctx, {**VALID_N8N_ENV, "SUDO_PASSWORD": VALID_SUDO_PASSWORD}, mode=0o644)
             with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
                 os.environ,
                 {"LSM_VPS_DOCKER_MODE": "n8n"},
@@ -313,6 +345,58 @@ class DockerHostingStackTests(unittest.TestCase):
                 with self.assertRaises(Blocked) as caught:
                     run_docker_hosting_stack(ctx)
         self.assertIn("mode 0600", str(caught.exception))
+
+    def test_unsafe_home_env_permissions_are_rejected_before_secret_read(self):
+        uid = str(os.getuid())
+        runner = ScriptedRunner([(DOCKER_CLONE, ""), (DOCKER_ENSURE_ENV, ""), (("id", "-u", "sadmin"), uid)])
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            write_home_env(ctx, mode=0o644)
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
+                os.environ,
+                {"LSM_VPS_DOCKER_MODE": "n8n"},
+                clear=False,
+            ):
+                with self.assertRaises(Blocked) as caught:
+                    run_docker_hosting_stack(ctx)
+        self.assertIn("/home/sadmin/.env", str(caught.exception))
+        self.assertIn("mode 0600", str(caught.exception))
+
+    def test_sudo_validation_failure_reports_sudo_handoff_not_cloudflare(self):
+        uid = str(os.getuid())
+        failed_validation = CommandResult(list(DOCKER_VALIDATE_N8N), 1, "", "SUDO_PASSWORD is empty and passwordless sudo is not available")
+        runner = ScriptedRunner(
+            [
+                (DOCKER_CLONE, ""),
+                (DOCKER_ENSURE_ENV, ""),
+                (("id", "-u", "sadmin"), uid),
+                (DOCKER_CHOWN_ENV, ""),
+                (DOCKER_AUDIT, ""),
+                (DOCKER_VALIDATE_N8N, failed_validation),
+            ]
+        )
+        prompts = PromptRecorder(
+            {
+                "Caddy ACME email for n8n HTTPS certificates": VALID_N8N_ENV["CADDY_ACME_EMAIL"],
+                "Cloudflare account ID": VALID_N8N_ENV["CF_ACCOUNT_ID"],
+                "Cloudflare API token": VALID_N8N_ENV["CF_API_TOKEN"],
+                "n8n public hostname": VALID_N8N_ENV["N8N_HOSTNAME"],
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            write_home_env(ctx)
+            prompts.attach(ctx)
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
+                os.environ,
+                {"LSM_VPS_DOCKER_MODE": "n8n"},
+                clear=False,
+            ):
+                with self.assertRaises(Blocked) as caught:
+                    run_docker_hosting_stack(ctx)
+        message = str(caught.exception)
+        self.assertIn("sudo credential", message)
+        self.assertNotIn("Cloudflare account ID/token permissions", message)
 
 
 if __name__ == "__main__":

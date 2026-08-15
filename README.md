@@ -116,7 +116,7 @@ instrumentation is scoped to `sadmin` and is removed during final hardening.
 The bootstrap never logs or stores:
 
 - root passwords
-- sudo passwords beyond the required `/home/sadmin/.env`
+- sudo passwords outside approved protected local env handoff files
 - GitHub tokens
 - Discord bot tokens
 - Codex auth files
@@ -132,6 +132,11 @@ It is owned by `sadmin:sadmin` and mode `0600`. It is not exported globally,
 copied into the relay `.env`, exposed to Docker containers, or passed as a
 process argument. Bootstrap code parses this file deliberately; it does not
 `source` arbitrary password text.
+
+When the Docker Hosting Stack module is selected, the bootstrap copies this
+same value into `/home/sadmin/docker-hosting-stack/.env` only after verifying
+both protected env-file boundaries. That repository env file is used by the
+stack's stdin-based sudo helper; it is not an application/container env file.
 
 ## Optional Modules
 
