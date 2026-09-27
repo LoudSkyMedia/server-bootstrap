@@ -49,7 +49,8 @@ State schema:
   },
   "facts": {
     "public_ipv4": "detected public IPv4",
-    "codex_session_id": "non-secret session UUID"
+    "codex_session_id": "non-secret session UUID",
+    "docker_hosting_mode": "base|standalone-app|n8n|website-migration"
   },
   "selected_modules": {
     "codex-vps-discord-relay": true,
@@ -299,6 +300,25 @@ protected ignored `/home/sadmin/docker-hosting-stack/.env` so the stack's own
 stdin-based sudo helper works in a fresh noninteractive `sadmin` process. This
 handoff must not place the value in bootstrap state, logs, command arguments,
 relay configuration, or application/container env files.
+
+Docker Hosting Stack capability selection happens during repository selection,
+before final host hardening. The selected nonsecret capability is persisted as
+`facts.docker_hosting_mode` and reused by Stage 15 and Stage 16. The user-facing
+capability names map to Docker validator modes as follows:
+
+```text
+base              -> base
+standalone-app    -> standalone-app
+n8n               -> n8n
+website-migration -> migration
+```
+
+That same capability controls final inbound firewall rules. Management SSH on
+`65500/tcp` is always retained. `base`, `n8n`, and `website-migration` retain
+public `80/tcp` and `443/tcp` for their public web workflows; `standalone-app`
+does not automatically imply public HTTP/HTTPS ingress. If a legacy state
+completed Stage 15 before the capability was recorded, Stage 16 records the
+capability and reconciles stale managed web allows before final completion.
 
 ## Release Trust
 

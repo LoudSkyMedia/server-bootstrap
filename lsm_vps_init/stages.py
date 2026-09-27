@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import getpass
+import ipaddress
 import json
 import os
 import re
 import secrets
 import shlex
+import socket
 import stat
 import sys
 import tomllib
@@ -43,16 +45,57 @@ DISCORD_ID_PATTERN = re.compile(r"^[0-9]{17,20}$")
 CODEX_WORK_ROOT = "/home/sadmin"
 SSHD_SADMIN_MATCH_CRITERIA = f"user=sadmin,host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport={SSH_PORT}"
 DOCKER_HOSTING_REPO = "/home/sadmin/docker-hosting-stack"
-DOCKER_HOSTING_MODES = {"base", "standalone-app", "n8n", "website-migration"}
+DOCKER_HOSTING_VALIDATOR_MODES = {
+    "base": "base",
+    "standalone-app": "standalone-app",
+    "n8n": "n8n",
+    "website-migration": "migration",
+}
+DOCKER_HOSTING_MODES = frozenset(DOCKER_HOSTING_VALIDATOR_MODES)
+DOCKER_HOSTING_WEB_INGRESS_MODES = frozenset({"base", "n8n", "website-migration"})
+DOCKER_HOSTING_WEB_PORTS = ("80/tcp", "443/tcp")
+DOCKER_BASE_PROVISIONING_ENV_KEYS = (
+    "INSTANCE_NAME",
+    "SERVER_FQDN",
+    "ADMIN_DOMAIN",
+    "SERVER_PUBLIC_IPV4",
+    "PHPMYADMIN_HOSTNAME",
+    "SFTPGO_ADMIN_HOSTNAME",
+    "CADDY_ACME_EMAIL",
+    "CF_ACCOUNT_ID",
+    "CF_API_TOKEN",
+)
+DOCKER_STANDALONE_PROVISIONING_ENV_KEYS = (
+    "INSTANCE_NAME",
+    "SERVER_PUBLIC_IPV4",
+)
 DOCKER_N8N_PROVISIONING_ENV_KEYS = (
+    "INSTANCE_NAME",
+    "SERVER_PUBLIC_IPV4",
     "CADDY_ACME_EMAIL",
     "CF_ACCOUNT_ID",
     "CF_API_TOKEN",
     "N8N_HOSTNAME",
 )
-DOCKER_HOSTING_MANAGED_ENV_KEYS = (*DOCKER_N8N_PROVISIONING_ENV_KEYS, "SUDO_PASSWORD")
+DOCKER_HOSTING_REQUIRED_ENV_KEYS_BY_MODE = {
+    "base": DOCKER_BASE_PROVISIONING_ENV_KEYS,
+    "standalone-app": DOCKER_STANDALONE_PROVISIONING_ENV_KEYS,
+    "n8n": DOCKER_N8N_PROVISIONING_ENV_KEYS,
+    "website-migration": DOCKER_BASE_PROVISIONING_ENV_KEYS,
+}
+DOCKER_HOSTING_MANAGED_ENV_KEYS = tuple(
+    dict.fromkeys(
+        (
+            *DOCKER_BASE_PROVISIONING_ENV_KEYS,
+            *DOCKER_STANDALONE_PROVISIONING_ENV_KEYS,
+            *DOCKER_N8N_PROVISIONING_ENV_KEYS,
+            "SUDO_PASSWORD",
+        )
+    )
+)
 DOCKER_N8N_REQUIRED_ENV_KEYS = DOCKER_N8N_PROVISIONING_ENV_KEYS
 DOCKER_HOSTING_SECRET_ENV_KEYS = ("CF_API_TOKEN", "SUDO_PASSWORD")
+FINAL_UFW_RECONCILED_PORTS = ("22/tcp", *DOCKER_HOSTING_WEB_PORTS)
 DEFAULT_SSH_IDENTITY_HINT = "~/.ssh/lsm_vps_ed25519"
 STAGE_TOTAL = 16
 MANAGEMENT_TOOL_COMMANDS = (
@@ -657,11 +700,49 @@ def render_ssh_dropin(phase: str) -> str:
     raise ValueError(f"unknown SSH phase: {phase}")
 
 
-def firewall_ports_for_modules(modules: dict[str, bool]) -> list[str]:
+def docker_hosting_mode_choices() -> str:
+    return ", ".join(sorted(DOCKER_HOSTING_MODES))
+
+
+def validate_docker_hosting_mode(mode: str | None) -> str:
+    candidate = (mode or "").strip()
+    if candidate not in DOCKER_HOSTING_VALIDATOR_MODES:
+        raise Blocked(f"Unsupported Docker hosting capability mode: {candidate or '<empty>'}. Expected one of: {docker_hosting_mode_choices()}.")
+    return candidate
+
+
+def docker_hosting_validator_mode(mode: str) -> str:
+    return DOCKER_HOSTING_VALIDATOR_MODES[validate_docker_hosting_mode(mode)]
+
+
+def docker_hosting_required_env_keys(mode: str) -> tuple[str, ...]:
+    return DOCKER_HOSTING_REQUIRED_ENV_KEYS_BY_MODE[validate_docker_hosting_mode(mode)]
+
+
+def docker_hosting_mode_requires_web_ingress(mode: str) -> bool:
+    return validate_docker_hosting_mode(mode) in DOCKER_HOSTING_WEB_INGRESS_MODES
+
+
+def selected_docker_hosting_mode(ctx: Context) -> str | None:
+    mode = ctx.state.get("facts", {}).get("docker_hosting_mode")
+    if mode is None:
+        return None
+    return validate_docker_hosting_mode(str(mode))
+
+
+def firewall_ports_for_modules(modules: dict[str, bool], docker_hosting_mode: str | None = None) -> list[str]:
     ports = [f"{SSH_PORT}/tcp"]
     if modules.get(DOCKER_MODULE):
-        ports.extend(["80/tcp", "443/tcp"])
+        mode = validate_docker_hosting_mode(docker_hosting_mode)
+        if docker_hosting_mode_requires_web_ingress(mode):
+            ports.extend(DOCKER_HOSTING_WEB_PORTS)
     return ports
+
+
+def firewall_ports_for_state(ctx: Context) -> list[str]:
+    modules = ctx.state.get("selected_modules", {})
+    mode = selected_docker_hosting_mode(ctx) if modules.get(DOCKER_MODULE) else None
+    return firewall_ports_for_modules(modules, mode)
 
 
 def render_ufw_phase_a_plan(current_ssh_port: str | None = None) -> list[str]:
@@ -695,6 +776,53 @@ def validate_ufw_phase_a_active_status(status_text: str, ports: list[str]) -> No
     for port in ports:
         if not ufw_status_allows(status_text, port):
             raise Failed(f"UFW Phase A did not retain required allow rule after enable: {port}")
+
+
+def validate_final_ufw_status(status_text: str, required_ports: list[str]) -> None:
+    if not ufw_status_is_active(status_text):
+        raise Failed("UFW Phase B is not active.")
+    if not ufw_status_defaults_are_safe(status_text):
+        raise Failed("UFW Phase B default policy is not deny incoming / allow outgoing.")
+    required = set(required_ports)
+    for port in required_ports:
+        if not ufw_status_allows(status_text, port):
+            raise Failed(f"UFW is missing required Phase B allow rule: {port}")
+    for port in FINAL_UFW_RECONCILED_PORTS:
+        if port not in required and ufw_status_allows(status_text, port):
+            raise Failed(f"UFW still allows {port} after Phase B hardening.")
+
+
+def delete_ufw_allow_if_present(ctx: Context, port: str) -> None:
+    for _ in range(3):
+        status = ctx.runner.run(["ufw", "status", "verbose"], check=False).stdout
+        if not ufw_status_allows(status, port):
+            return
+        ctx.runner.run(["ufw", "delete", "allow", port], check=False)
+
+
+def reconcile_ufw_final_rules(ctx: Context, required_ports: list[str]) -> None:
+    required = set(required_ports)
+    for port in required_ports:
+        ctx.runner.run(["ufw", "allow", port])
+    for port in FINAL_UFW_RECONCILED_PORTS:
+        if port not in required:
+            delete_ufw_allow_if_present(ctx, port)
+    ctx.runner.run(["ufw", "--force", "enable"])
+    status = ctx.runner.run(["ufw", "status", "verbose"]).stdout
+    validate_final_ufw_status(status, required_ports)
+
+
+def reconcile_completed_final_firewall(ctx: Context, mode: str) -> None:
+    if ctx.dry_run or ctx.state.get("stages", {}).get("final_host_hardening", {}).get("status") != "completed":
+        return
+    ports = firewall_ports_for_modules(ctx.state.get("selected_modules", {}), mode)
+    status = ctx.runner.run(["ufw", "status", "verbose"], check=False).stdout
+    try:
+        validate_final_ufw_status(status, ports)
+        return
+    except Failed:
+        pass
+    reconcile_ufw_final_rules(ctx, ports)
 
 
 def codex_reasoning_config_arg(reasoning: str = REQUIRED_CODEX_REASONING) -> str:
@@ -1216,7 +1344,11 @@ def revalidate_before_final_hardening(ctx: Context) -> None:
             result = ctx.runner.run(["docker", "ps", "--format", "{{.Names}}\t{{.Ports}}"], check=False)
             if result.returncode == 0:
                 published = parse_docker_published_ports(result.stdout)
-                allowed = {80, 443} if ctx.state.get("selected_modules", {}).get(DOCKER_MODULE) else set()
+                allowed: set[int] = set()
+                if ctx.state.get("selected_modules", {}).get(DOCKER_MODULE):
+                    mode = selected_docker_hosting_mode(ctx)
+                    if mode and docker_hosting_mode_requires_web_ingress(mode):
+                        allowed = {80, 443}
                 unexpected = published - allowed
                 if unexpected:
                     issues.append(f"Docker has unexpected host-published public port(s): {', '.join(str(port) for port in sorted(unexpected))}")
@@ -1603,7 +1735,42 @@ def run_codex_manager_session(ctx: Context) -> StageResult:
 
 def detect_repository_selection(ctx: Context) -> bool:
     modules = ctx.state.get("selected_modules", {})
-    return RELAY_MODULE in modules and DOCKER_MODULE in modules
+    if RELAY_MODULE not in modules or DOCKER_MODULE not in modules:
+        return False
+    if modules.get(DOCKER_MODULE):
+        try:
+            selected_docker_hosting_mode(ctx)
+        except Blocked:
+            return False
+    return True
+
+
+def resolve_docker_hosting_mode(ctx: Context, *, prompt: bool, default: str = "base") -> str:
+    env_mode = os.environ.get("LSM_VPS_DOCKER_MODE")
+    if env_mode:
+        mode = validate_docker_hosting_mode(env_mode)
+        set_fact(ctx.state, "docker_hosting_mode", mode)
+        return mode
+
+    mode = selected_docker_hosting_mode(ctx)
+    if mode:
+        return mode
+
+    if ctx.dry_run:
+        mode = validate_docker_hosting_mode(default)
+        set_fact(ctx.state, "docker_hosting_mode", mode)
+        return mode
+
+    if not prompt:
+        raise Blocked("Docker Hosting Stack capability mode must be selected before firewall hardening.")
+
+    mode = ctx.prompt_text(
+        "Docker hosting capability mode (base, standalone-app, n8n, website-migration)",
+        default=default,
+    )
+    mode = validate_docker_hosting_mode(mode)
+    set_fact(ctx.state, "docker_hosting_mode", mode)
+    return mode
 
 
 def run_repository_selection(ctx: Context) -> StageResult:
@@ -1613,6 +1780,8 @@ def run_repository_selection(ctx: Context) -> StageResult:
         selected = {item.strip() for item in env_modules.split(",") if item.strip()}
         select_module(ctx.state, RELAY_MODULE, RELAY_MODULE in selected or "relay" in selected)
         select_module(ctx.state, DOCKER_MODULE, DOCKER_MODULE in selected or "docker" in selected or "hosting" in selected)
+    elif RELAY_MODULE in ctx.state.get("selected_modules", {}) and DOCKER_MODULE in ctx.state.get("selected_modules", {}):
+        pass
     elif ctx.dry_run:
         select_module(ctx.state, RELAY_MODULE, True)
         select_module(ctx.state, DOCKER_MODULE, False)
@@ -1621,6 +1790,8 @@ def run_repository_selection(ctx: Context) -> StageResult:
         docker = ctx.confirm("Install Docker Hosting Stack module now?", default=False)
         select_module(ctx.state, RELAY_MODULE, relay)
         select_module(ctx.state, DOCKER_MODULE, docker)
+    if ctx.state.get("selected_modules", {}).get(DOCKER_MODULE):
+        resolve_docker_hosting_mode(ctx, prompt=True)
     return StageResult("completed", "Repository module selection recorded.", {"selected_modules": ctx.state["selected_modules"]})
 
 
@@ -2060,14 +2231,27 @@ def detect_final_host_hardening(ctx: Context) -> bool:
         validate_final_sshd_effective_config(result.stdout, sadmin_result.stdout)
     except Failed:
         return False
-    return (
-        ctx.runner.run(["ufw", "status"], check=False).stdout.lower().find("active") >= 0
-    )
+    status_result = ctx.runner.run(["ufw", "status", "verbose"], check=False)
+    if status_result.returncode != 0 or not ufw_status_is_active(status_result.stdout):
+        return False
+    if ctx.state.get("selected_modules", {}).get(DOCKER_MODULE):
+        try:
+            if selected_docker_hosting_mode(ctx) is None:
+                return True
+        except Blocked:
+            return False
+    try:
+        validate_final_ufw_status(status_result.stdout, firewall_ports_for_state(ctx))
+    except Failed:
+        return False
+    return True
 
 
 def run_final_host_hardening(ctx: Context) -> StageResult:
     ctx.require_root()
     stage_intro(ctx, "final_host_hardening")
+    if ctx.state.get("selected_modules", {}).get(DOCKER_MODULE):
+        resolve_docker_hosting_mode(ctx, prompt=True)
     if ctx.dry_run and not ctx.layout.mock_root:
         if not ctx.state.get("checkpoints", {}).get("ssh_recovery_verified"):
             raise Blocked("Refusing hardening: sadmin SSH recovery on port 65500 is not verified.")
@@ -2075,7 +2259,7 @@ def run_final_host_hardening(ctx: Context) -> StageResult:
             raise Blocked("Refusing hardening: Discord/Codex relay round trip is not verified.")
     else:
         revalidate_before_final_hardening(ctx)
-    ports = firewall_ports_for_modules(ctx.state.get("selected_modules", {}))
+    ports = firewall_ports_for_state(ctx)
     plan = "\n".join(
         [
             "Final hardening plan:",
@@ -2111,20 +2295,7 @@ def run_final_host_hardening(ctx: Context) -> StageResult:
         ctx.runner.run(["apt-get", "install", "-y", "ufw", "fail2ban", "unattended-upgrades"])
         ctx.runner.run(["ufw", "default", "deny", "incoming"])
         ctx.runner.run(["ufw", "default", "allow", "outgoing"])
-        for port in ports:
-            ctx.runner.run(["ufw", "allow", port])
-        for _ in range(3):
-            status = ctx.runner.run(["ufw", "status", "verbose"], check=False).stdout
-            if not ufw_status_allows(status, "22/tcp"):
-                break
-            ctx.runner.run(["ufw", "delete", "allow", "22/tcp"], check=False)
-        ctx.runner.run(["ufw", "--force", "enable"])
-        status = ctx.runner.run(["ufw", "status", "verbose"]).stdout
-        if ufw_status_allows(status, "22/tcp"):
-            raise Failed("UFW still allows 22/tcp after Phase B hardening.")
-        for port in ports:
-            if not ufw_status_allows(status, port):
-                raise Failed(f"UFW is missing required Phase B allow rule: {port}")
+        reconcile_ufw_final_rules(ctx, ports)
         fail2ban = (
             "[sshd]\n"
             "enabled = true\n"
@@ -2216,78 +2387,176 @@ def _single_line_value(value: str) -> bool:
     return bool(value) and "\x00" not in value and "\n" not in value and "\r" not in value
 
 
-def validate_docker_n8n_env_value(key: str, value: str) -> bool:
+def docker_env_value_is_placeholder(key: str, value: str) -> bool:
+    lower_value = value.lower()
+    if value in {
+        "example-vps",
+        "server.example.com",
+        "admin.example.com",
+        "webmail.example.com",
+        "pma.example.com",
+        "pma.admin.example.com",
+        "sftp.example.com",
+        "sftp.admin.example.com",
+    }:
+        return True
+    if value == "example.com" or value.endswith(".example.com"):
+        return True
+    if key == "CADDY_ACME_EMAIL" and lower_value.endswith("@example.com"):
+        return True
+    if key in {"SERVER_PUBLIC_IPV4", "MAIL_IPV4", "DEDICATED_WEB_IPV4"}:
+        return any(value.startswith(prefix) for prefix in ("203.0.113.", "192.0.2.", "198.51.100."))
+    return False
+
+
+def validate_hostname_value(value: str) -> bool:
+    candidate = value.strip().rstrip(".")
+    if "://" in candidate or "/" in candidate or len(candidate) > 253:
+        return False
+    labels = candidate.split(".")
+    if len(labels) < 2:
+        return False
+    return all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) for label in labels)
+
+
+def validate_ipv4_value(value: str) -> bool:
+    try:
+        ipaddress.IPv4Address(value.strip())
+    except ValueError:
+        return False
+    return True
+
+
+def validate_docker_hosting_env_value(key: str, value: str) -> bool:
     if not _single_line_value(value):
         return False
-    if key == "SUDO_PASSWORD":
+    if key in {"SUDO_PASSWORD", "CF_API_TOKEN"}:
         return True
+    stripped = value.strip()
+    if docker_env_value_is_placeholder(key, stripped):
+        return False
+    if key == "INSTANCE_NAME":
+        return bool(stripped)
+    if key in {"SERVER_FQDN", "ADMIN_DOMAIN", "PHPMYADMIN_HOSTNAME", "SFTPGO_ADMIN_HOSTNAME", "N8N_HOSTNAME"}:
+        return validate_hostname_value(stripped)
+    if key == "SERVER_PUBLIC_IPV4":
+        return validate_ipv4_value(stripped)
     if key == "CADDY_ACME_EMAIL":
-        return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value.strip()))
+        return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", stripped))
     if key == "CF_ACCOUNT_ID":
-        return bool(re.fullmatch(r"[A-Za-z0-9_-]{16,128}", value.strip()))
-    if key == "CF_API_TOKEN":
-        return True
-    if key == "N8N_HOSTNAME":
-        candidate = value.strip().rstrip(".")
-        if "://" in candidate or "/" in candidate or len(candidate) > 253:
-            return False
-        labels = candidate.split(".")
-        if len(labels) < 2:
-            return False
-        return all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) for label in labels)
-    return bool(value)
+        return bool(re.fullmatch(r"[A-Za-z0-9_-]{16,128}", stripped))
+    return bool(stripped)
+
+
+def validate_docker_n8n_env_value(key: str, value: str) -> bool:
+    return validate_docker_hosting_env_value(key, value)
 
 
 def docker_existing_value_valid(key: str, value: str) -> bool:
-    return validate_docker_n8n_env_value(key, value)
+    return validate_docker_hosting_env_value(key, value)
+
+
+def print_docker_hosting_guidance(mode: str) -> None:
+    print()
+    print(f"Docker Hosting Stack {mode} setup")
+    print("Prepare the required values before continuing. Copied example placeholders are treated as missing.")
+    if mode == "standalone-app":
+        print("- INSTANCE_NAME: nonsecret label for this host/application capability.")
+        print("- SERVER_PUBLIC_IPV4: public IPv4 for this VPS.")
+        print("- This mode does not require Cloudflare, Caddy, phpMyAdmin, SFTPGo, or public 80/443 ingress.")
+    elif mode == "n8n":
+        print("- INSTANCE_NAME: nonsecret label for this host.")
+        print("- SERVER_PUBLIC_IPV4: public IPv4 for this VPS.")
+        print("- CADDY_ACME_EMAIL: email used by Caddy for ACME/certificate operations.")
+        print("- CF_ACCOUNT_ID: Cloudflare account ID from the Cloudflare dashboard account URL/sidebar.")
+        print("- CF_API_TOKEN: SECRET created in Cloudflare API Tokens with least privilege.")
+        print("- N8N_HOSTNAME: public hostname intended for the n8n instance; DNS must be ready for validation.")
+        print("- N8N_ENCRYPTION_KEY is not collected into the hosting repository .env.")
+        print("  It belongs to the hosting stack's protected n8n secret workflow.")
+    else:
+        print("- INSTANCE_NAME, SERVER_FQDN, ADMIN_DOMAIN, and SERVER_PUBLIC_IPV4 for the hosting VPS.")
+        print("- PHPMYADMIN_HOSTNAME and SFTPGO_ADMIN_HOSTNAME for admin tooling.")
+        print("- CADDY_ACME_EMAIL, CF_ACCOUNT_ID, and a least-privilege CF_API_TOKEN for public HTTPS/DNS validation.")
 
 
 def print_docker_n8n_guidance() -> None:
-    print()
-    print("Docker Hosting Stack n8n setup")
-    print("Prepare these values before continuing:")
-    print("- CADDY_ACME_EMAIL: email used by Caddy for ACME/certificate operations.")
-    print("- CF_ACCOUNT_ID: Cloudflare account ID from the Cloudflare dashboard account URL/sidebar.")
-    print("- CF_API_TOKEN: SECRET created in Cloudflare API Tokens with least privilege.")
-    print("- N8N_HOSTNAME: public hostname intended for the n8n instance; DNS must be ready for validation.")
-    print("- Cloudflare token guidance: Zone read for audited zones; DNS edit only for changed zones; Account read only if validation requires it.")
-    print("- N8N_ENCRYPTION_KEY is not collected into the hosting repository .env.")
-    print("  It belongs to the hosting stack's protected n8n secret workflow.")
+    print_docker_hosting_guidance("n8n")
 
 
-def _prompt_docker_n8n_value(ctx: Context, key: str) -> str:
+def docker_derived_env_default(ctx: Context, key: str) -> str | None:
+    if key == "SERVER_PUBLIC_IPV4":
+        value = str(ctx.state.get("facts", {}).get("public_ipv4") or "").strip()
+        if validate_docker_hosting_env_value(key, value):
+            return value
+    if key == "INSTANCE_NAME":
+        value = str(ctx.state.get("facts", {}).get("instance_name") or "").strip()
+        if validate_docker_hosting_env_value(key, value):
+            return value
+        value = socket.gethostname().strip()
+        if validate_docker_hosting_env_value(key, value):
+            return value
+    return None
+
+
+def docker_prompt_label(mode: str, key: str) -> str:
+    labels = {
+        "INSTANCE_NAME": "Docker Hosting Stack instance name",
+        "SERVER_FQDN": "Server FQDN",
+        "ADMIN_DOMAIN": "Admin domain",
+        "SERVER_PUBLIC_IPV4": "Server public IPv4 address",
+        "PHPMYADMIN_HOSTNAME": "phpMyAdmin hostname",
+        "SFTPGO_ADMIN_HOSTNAME": "SFTPGo admin hostname",
+        "CADDY_ACME_EMAIL": "Caddy ACME email for n8n HTTPS certificates" if mode == "n8n" else "Caddy ACME email for HTTPS certificates",
+        "CF_ACCOUNT_ID": "Cloudflare account ID",
+        "CF_API_TOKEN": "Cloudflare API token",
+        "N8N_HOSTNAME": "n8n public hostname",
+    }
+    return labels.get(key, key)
+
+
+def _prompt_docker_hosting_value(ctx: Context, mode: str, key: str) -> str:
+    default = docker_derived_env_default(ctx, key)
+    if default and key in {"INSTANCE_NAME", "SERVER_PUBLIC_IPV4"}:
+        return default
     if key == "CADDY_ACME_EMAIL":
-        value = ctx.prompt_text("Caddy ACME email for n8n HTTPS certificates")
-    elif key == "CF_ACCOUNT_ID":
-        value = ctx.prompt_text("Cloudflare account ID")
+        value = ctx.prompt_text(docker_prompt_label(mode, key), default=default)
     elif key == "CF_API_TOKEN":
-        value = ctx.prompt_secret("Cloudflare API token", confirm=False)
+        value = ctx.prompt_secret(docker_prompt_label(mode, key), confirm=False)
     elif key == "N8N_HOSTNAME":
-        value = ctx.prompt_text("n8n public hostname")
+        value = ctx.prompt_text(docker_prompt_label(mode, key), default=default)
     elif key == "SUDO_PASSWORD":
         raise AssertionError("SUDO_PASSWORD is copied from /home/sadmin/.env, not prompted")
     else:
-        value = ctx.prompt_text(key)
-    if not validate_docker_n8n_env_value(key, value):
-        raise Blocked(f"{key} is missing or invalid for Docker Hosting Stack n8n provisioning.")
+        value = ctx.prompt_text(docker_prompt_label(mode, key), default=default)
+    if not validate_docker_hosting_env_value(key, value):
+        raise Blocked(f"{key} is missing or invalid for Docker Hosting Stack {mode} provisioning.")
     return value
 
 
-def docker_n8n_env_updates(ctx: Context, existing_values: dict[str, str]) -> dict[str, str]:
+def _prompt_docker_n8n_value(ctx: Context, key: str) -> str:
+    return _prompt_docker_hosting_value(ctx, "n8n", key)
+
+
+def docker_hosting_mode_env_updates(ctx: Context, mode: str, existing_values: dict[str, str]) -> dict[str, str]:
     updates: dict[str, str] = {}
-    missing = [key for key in DOCKER_N8N_PROVISIONING_ENV_KEYS if not docker_existing_value_valid(key, existing_values.get(key, ""))]
+    required_keys = docker_hosting_required_env_keys(mode)
+    missing = [key for key in required_keys if not docker_existing_value_valid(key, existing_values.get(key, ""))]
     if missing:
-        print_docker_n8n_guidance()
+        print_docker_hosting_guidance(mode)
         confirm_ready_or_pause(
             ctx,
-            "Are the Docker/n8n provisioning values ready now?",
-            "Paused before Docker Hosting Stack n8n configuration.",
+            f"Are the Docker Hosting Stack {mode} values ready now?",
+            f"Paused before Docker Hosting Stack {mode} configuration.",
         )
-    for key in DOCKER_N8N_PROVISIONING_ENV_KEYS:
+    for key in required_keys:
         if docker_existing_value_valid(key, existing_values.get(key, "")):
             continue
-        updates[key] = _prompt_docker_n8n_value(ctx, key)
+        updates[key] = _prompt_docker_hosting_value(ctx, mode, key)
     return updates
+
+
+def docker_n8n_env_updates(ctx: Context, existing_values: dict[str, str]) -> dict[str, str]:
+    return docker_hosting_mode_env_updates(ctx, "n8n", existing_values)
 
 
 def read_sadmin_sudo_password(ctx: Context, uid: int) -> str:
@@ -2317,8 +2586,7 @@ def docker_hosting_env_updates(ctx: Context, mode: str, existing_values: dict[st
     updates: dict[str, str] = {}
     if existing_values.get("SUDO_PASSWORD") != sudo_password:
         updates["SUDO_PASSWORD"] = sudo_password
-    if mode == "n8n":
-        updates.update(docker_n8n_env_updates(ctx, existing_values))
+    updates.update(docker_hosting_mode_env_updates(ctx, mode, {**existing_values, **updates}))
     return updates
 
 
@@ -2367,15 +2635,9 @@ def run_docker_hosting_stack(ctx: Context) -> StageResult:
             "Would clone Docker Hosting Stack and run repo-owned audit/validation/dry-run workflows.",
             {"handoff": "LoudSkyMedia/docker-hosting-stack"},
         )
-    mode = os.environ.get("LSM_VPS_DOCKER_MODE") or ctx.state.get("facts", {}).get("docker_hosting_mode")
-    if not mode:
-        mode = ctx.prompt_text(
-            "Docker hosting capability mode (base, standalone-app, n8n, website-migration)",
-            default="base",
-        )
-    if mode not in DOCKER_HOSTING_MODES:
-        raise Blocked("Unsupported Docker hosting capability mode.")
-    set_fact(ctx.state, "docker_hosting_mode", mode)
+    mode = resolve_docker_hosting_mode(ctx, prompt=True)
+    validation_mode = docker_hosting_validator_mode(mode)
+    reconcile_completed_final_firewall(ctx, mode)
     clone_script = (
         "if [ -d /home/sadmin/docker-hosting-stack/.git ]; then "
         "cd /home/sadmin/docker-hosting-stack && git pull --ff-only; "
@@ -2385,7 +2647,6 @@ def run_docker_hosting_stack(ctx: Context) -> StageResult:
     ctx.sadmin_shell("cd /home/sadmin/docker-hosting-stack && test -f .env || install -m 0600 .env.example .env")
     repo_path = ctx.layout.sadmin_home / "docker-hosting-stack"
     docker_env_values = ensure_docker_hosting_env(ctx, repo_path, mode)
-    validation_mode = "n8n" if mode == "n8n" else "base"
     redactions = [docker_env_values[key] for key in DOCKER_HOSTING_SECRET_ENV_KEYS if docker_env_values.get(key)]
     ctx.sadmin_shell(
         "cd /home/sadmin/docker-hosting-stack && scripts/audit_host_baseline.sh --output docs/instances/bootstrap/audits/host-baseline-$(date -u +%F).md",
@@ -2404,7 +2665,7 @@ def run_docker_hosting_stack(ctx: Context) -> StageResult:
         ctx.sadmin_shell("cd /home/sadmin/docker-hosting-stack && scripts/install_n8n.sh --dry-run", timeout=180, redact_values=redactions)
     else:
         ctx.sadmin_shell("cd /home/sadmin/docker-hosting-stack && scripts/bootstrap_layout.sh --dry-run", timeout=180, redact_values=redactions)
-    return StageResult("completed", f"Docker Hosting Stack handoff dry-run completed for mode: {mode}.")
+    return StageResult("completed", f"Docker Hosting Stack handoff dry-run completed for mode: {mode}.", {"docker_hosting_mode": mode, "validator_mode": validation_mode})
 
 
 STAGES: list[StageDefinition] = [

@@ -41,6 +41,8 @@ VPS.
 - [ ] VPS Server Manager session can be resumed directly.
 - [ ] Relay module selected.
 - [ ] Docker Hosting Stack module selected for dry-run handoff.
+- [ ] Docker Hosting Stack capability selected before final host hardening.
+- [ ] Docker Hosting Stack capability persisted in state without secrets.
 - [ ] Relay repository cloned to `/home/sadmin/codex-vps-discord-relay`.
 - [ ] Relay `.env` is `sadmin:sadmin` mode `600`.
 - [ ] Relay `.env` does not contain the sudo-password key.
@@ -59,6 +61,8 @@ VPS.
 - [ ] Effective SSH config retains only port `65500`.
 - [ ] Final effective config does not retain `ExposeAuthInfo yes`.
 - [ ] UFW Phase B removed `22/tcp` and retained `65500/tcp`.
+- [ ] UFW Phase B retained `80/tcp` and `443/tcp` only for `base`, `n8n`, or `website-migration`.
+- [ ] `standalone-app` did not automatically allow inbound `80/tcp` or `443/tcp`.
 - [ ] fail2ban SSH jail is active on port `65500`.
 - [ ] Unattended upgrades are configured.
 - [ ] New `sadmin` key-only SSH session succeeds on port `65500`.
@@ -74,6 +78,8 @@ VPS.
 - [ ] Post-final-reboot UFW and fail2ban remain active.
 - [ ] Bootstrap status reports complete or only documented residuals.
 - [ ] Docker Hosting Stack module exercised in dry-run/validation mode only.
+- [ ] Docker validator mode matched capability: `base`, `standalone-app`, `n8n`, or `migration` for `website-migration`.
+- [ ] Stage 16 resume after `.env` correction reused the selected capability without repeating completed security stages.
 - [ ] Installed bootstrap source secret scan passed.
 - [ ] State/log token-shape scan passed.
 - [ ] Final status, listener, UFW, fail2ban, and service evidence captured.

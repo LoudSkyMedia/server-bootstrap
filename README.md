@@ -189,11 +189,31 @@ Never paste the Discord bot token into Discord, a GitHub issue, documentation,
 or a shell command argument. Paste it only into the bootstrap hidden secret
 prompt. Rotate the token immediately if it is exposed.
 
-## Prepare Docker/n8n Credentials
+## Prepare Docker Hosting Capability Values
 
-This is required only when selecting Docker Hosting Stack n8n.
+When selecting the Docker Hosting Stack module, choose the intended capability
+during repository selection, before final host hardening. The capability is
+persisted as nonsecret state and reused for Stage 15 firewall rules and Stage 16
+validation/dry-run handoff.
 
-Have these values ready:
+Capability-to-validator mapping:
+
+```text
+base              -> base
+standalone-app    -> standalone-app
+n8n               -> n8n
+website-migration -> migration
+```
+
+For `standalone-app`, have only these Docker stack values ready:
+
+- `INSTANCE_NAME`: nonsecret host/application label.
+- `SERVER_PUBLIC_IPV4`: public IPv4 for this VPS.
+
+`standalone-app` does not automatically open inbound `80/tcp` or `443/tcp` and
+does not require Cloudflare, Caddy, phpMyAdmin, SFTPGo, or admin hostnames.
+
+For `n8n`, also have these values ready:
 
 - `CADDY_ACME_EMAIL`: email address for Caddy ACME/HTTPS certificate issuance.
 - `CF_ACCOUNT_ID`: Cloudflare account ID.
@@ -209,6 +229,11 @@ Use least-privilege Cloudflare API tokens:
 Do not put `N8N_ENCRYPTION_KEY` in the Docker Hosting Stack repository `.env`.
 That secret belongs under `/srv/hosting/secrets/n8n/n8n.env` in the hosting
 stack workflow.
+
+For `base` and `website-migration`, prepare the full shared-hosting contract
+required by the Docker stack validator. `website-migration` remains the
+server-bootstrap capability name and maps explicitly to Docker validator mode
+`migration`.
 
 ## Start A New VPS
 
@@ -354,11 +379,15 @@ Initial module contracts:
   `/home/sadmin/docker-hosting-stack`, starts with the repository's audit,
   validation, and dry-run workflows, then follows its runbooks for selected
   hosting capabilities such as base hosting, standalone apps, n8n, or website
-  migration.
+  migration. The selected capability is recorded before final host hardening;
+  Stage 16 reuses it, validates the matching Docker stack mode, and remains
+  resumable after `.env` correction.
 
 The Discord relay is outbound-only and should not open an inbound public port.
 Docker hosting ingress ports are derived from selected capabilities, not from a
-large static allowlist. Published Docker host ports are inspected directly
+large static allowlist. `standalone-app` keeps only management SSH by default;
+`base`, `n8n`, and `website-migration` retain public HTTP/HTTPS only for their
+public web workflows. Published Docker host ports are inspected directly
 because Docker-published traffic is not assumed to be constrained by UFW alone.
 
 ## Development / Acceptance

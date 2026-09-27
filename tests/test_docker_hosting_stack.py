@@ -6,13 +6,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from lsm_vps_init.state import default_state
+from lsm_vps_init.state import default_state, set_stage
 from lsm_vps_init.stages import (
+    DOCKER_HOSTING_VALIDATOR_MODES,
     DOCKER_HOSTING_REPO,
     DOCKER_MODULE,
     Blocked,
     Context,
     docker_n8n_env_updates,
+    docker_existing_value_valid,
+    docker_hosting_validator_mode,
+    run_repository_selection,
     run_docker_hosting_stack,
 )
 from lsm_vps_init.util import CommandResult, PathLayout, merge_env_text, parse_env_value
@@ -37,17 +41,54 @@ DOCKER_CHOWN_ENV = ("chown", "sadmin:sadmin", f"{DOCKER_HOSTING_REPO}/.env")
 DOCKER_AUDIT = sadmin_args(
     "cd /home/sadmin/docker-hosting-stack && scripts/audit_host_baseline.sh --output docs/instances/bootstrap/audits/host-baseline-$(date -u +%F).md"
 )
+DOCKER_VALIDATE_BASE = sadmin_args("cd /home/sadmin/docker-hosting-stack && scripts/validate_env.sh --mode base")
+DOCKER_VALIDATE_STANDALONE = sadmin_args("cd /home/sadmin/docker-hosting-stack && scripts/validate_env.sh --mode standalone-app")
 DOCKER_VALIDATE_N8N = sadmin_args("cd /home/sadmin/docker-hosting-stack && scripts/validate_env.sh --mode n8n")
+DOCKER_VALIDATE_MIGRATION = sadmin_args("cd /home/sadmin/docker-hosting-stack && scripts/validate_env.sh --mode migration")
+DOCKER_LAYOUT_DRY_RUN = sadmin_args("cd /home/sadmin/docker-hosting-stack && scripts/bootstrap_layout.sh --dry-run")
 DOCKER_INSTALL_N8N_DRY_RUN = sadmin_args("cd /home/sadmin/docker-hosting-stack && scripts/install_n8n.sh --dry-run")
 
 
+VALID_INSTANCE_ENV = {
+    "INSTANCE_NAME": "test-vps",
+    "SERVER_PUBLIC_IPV4": "8.8.8.8",
+}
 VALID_N8N_ENV = {
-    "CADDY_ACME_EMAIL": "ops@example.com",
+    **VALID_INSTANCE_ENV,
+    "CADDY_ACME_EMAIL": "ops@valid.test",
     "CF_ACCOUNT_ID": "0123456789abcdef0123456789abcdef",
     "CF_API_TOKEN": "cf_api_token_placeholder_value",
-    "N8N_HOSTNAME": "n8n.example.com",
+    "N8N_HOSTNAME": "n8n.valid.test",
+}
+VALID_BASE_ENV = {
+    **VALID_INSTANCE_ENV,
+    "SERVER_FQDN": "server.valid.test",
+    "ADMIN_DOMAIN": "admin.valid.test",
+    "PHPMYADMIN_HOSTNAME": "pma.valid.test",
+    "SFTPGO_ADMIN_HOSTNAME": "sftp.valid.test",
+    "CADDY_ACME_EMAIL": "ops@valid.test",
+    "CF_ACCOUNT_ID": "0123456789abcdef0123456789abcdef",
+    "CF_API_TOKEN": "cf_api_token_placeholder_value",
 }
 VALID_SUDO_PASSWORD = " leading sudo\tplaceholder ' \" $ # = \\ ` ; () ! trailing "
+FINAL_UFW_WITH_STALE_WEB = (
+    "Status: active\n"
+    "Default: deny (incoming), allow (outgoing), disabled (routed)\n"
+    "65500/tcp ALLOW IN Anywhere\n"
+    "80/tcp ALLOW IN Anywhere\n"
+    "443/tcp ALLOW IN Anywhere\n"
+)
+FINAL_UFW_WITH_443_ONLY = (
+    "Status: active\n"
+    "Default: deny (incoming), allow (outgoing), disabled (routed)\n"
+    "65500/tcp ALLOW IN Anywhere\n"
+    "443/tcp ALLOW IN Anywhere\n"
+)
+FINAL_UFW_STANDALONE = (
+    "Status: active\n"
+    "Default: deny (incoming), allow (outgoing), disabled (routed)\n"
+    "65500/tcp ALLOW IN Anywhere\n"
+)
 
 
 class PromptRecorder:
@@ -116,6 +157,8 @@ def make_context(tmp, runner):
     layout = PathLayout(mock_root=Path(tmp) / "root", state_dir=Path(tmp) / "state")
     state = default_state()
     state["selected_modules"][DOCKER_MODULE] = True
+    state["facts"]["instance_name"] = VALID_INSTANCE_ENV["INSTANCE_NAME"]
+    state["facts"]["public_ipv4"] = VALID_INSTANCE_ENV["SERVER_PUBLIC_IPV4"]
     return Context(layout=layout, state=state, runner=runner, dry_run=False)
 
 
@@ -158,7 +201,178 @@ def successful_existing_n8n_commands(uid):
     ]
 
 
+def successful_existing_commands(uid, validate_command, dry_run_command):
+    return [
+        (DOCKER_CLONE, ""),
+        (DOCKER_ENSURE_ENV, ""),
+        (("id", "-u", "sadmin"), uid),
+        (DOCKER_AUDIT, ""),
+        (validate_command, ""),
+        (dry_run_command, ""),
+    ]
+
+
 class DockerHostingStackTests(unittest.TestCase):
+    def test_explicit_capability_to_validator_mapping(self):
+        self.assertEqual(
+            {mode: docker_hosting_validator_mode(mode) for mode in DOCKER_HOSTING_VALIDATOR_MODES},
+            {
+                "base": "base",
+                "standalone-app": "standalone-app",
+                "n8n": "n8n",
+                "website-migration": "migration",
+            },
+        )
+
+    def test_unknown_capability_is_rejected(self):
+        with self.assertRaises(Blocked):
+            docker_hosting_validator_mode("unknown-mode")
+
+    def test_sudo_password_is_not_rejected_as_placeholder_text(self):
+        self.assertTrue(docker_existing_value_valid("SUDO_PASSWORD", "example-vps"))
+        self.assertTrue(docker_existing_value_valid("SUDO_PASSWORD", "203.0.113.10"))
+
+    def test_standalone_app_uses_standalone_validator_and_layout_dry_run_without_cloudflare_prompts(self):
+        uid = str(os.getuid())
+        runner = ScriptedRunner(
+            [
+                (DOCKER_CLONE, ""),
+                (DOCKER_ENSURE_ENV, ""),
+                (("id", "-u", "sadmin"), uid),
+                (DOCKER_CHOWN_ENV, ""),
+                (DOCKER_AUDIT, ""),
+                (DOCKER_VALIDATE_STANDALONE, ""),
+                (DOCKER_LAYOUT_DRY_RUN, ""),
+            ]
+        )
+        prompts = PromptRecorder({})
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            write_home_env(ctx)
+            prompts.attach(ctx)
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
+                os.environ,
+                {"LSM_VPS_DOCKER_MODE": "standalone-app"},
+                clear=False,
+            ):
+                result = run_docker_hosting_stack(ctx)
+            written = (ctx.layout.sadmin_home / "docker-hosting-stack" / ".env").read_text(encoding="utf-8")
+
+        self.assertEqual(result.status, "completed")
+        self.assertIn(DOCKER_VALIDATE_STANDALONE, runner.calls)
+        self.assertNotIn(DOCKER_VALIDATE_BASE, runner.calls)
+        self.assertEqual(prompts.secret_prompts, [])
+        self.assertNotIn("Cloudflare account ID", prompts.text_prompts)
+        self.assertNotIn("Caddy ACME email for HTTPS certificates", prompts.text_prompts)
+        self.assertEqual(parse_env_value(written, "INSTANCE_NAME"), VALID_INSTANCE_ENV["INSTANCE_NAME"])
+        self.assertEqual(parse_env_value(written, "SERVER_PUBLIC_IPV4"), VALID_INSTANCE_ENV["SERVER_PUBLIC_IPV4"])
+        self.assertIsNone(parse_env_value(written, "CF_API_TOKEN"))
+
+    def test_existing_standalone_values_are_reused_on_resume_without_reprompting(self):
+        uid = str(os.getuid())
+        runner = ScriptedRunner(successful_existing_commands(uid, DOCKER_VALIDATE_STANDALONE, DOCKER_LAYOUT_DRY_RUN))
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            write_home_env(ctx)
+            env_path = write_docker_env(ctx, {**VALID_INSTANCE_ENV, "SUDO_PASSWORD": VALID_SUDO_PASSWORD, "UNRELATED_KEEP": "yes"})
+            ctx.prompt_secret = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("secret prompted on resume"))
+            ctx.prompt_text = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("text prompted on resume"))
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
+                os.environ,
+                {"LSM_VPS_DOCKER_MODE": "standalone-app"},
+                clear=False,
+            ):
+                result = run_docker_hosting_stack(ctx)
+            written = env_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(parse_env_value(written, "UNRELATED_KEEP"), "yes")
+        self.assertEqual(runner.responses, [])
+
+    def test_website_migration_uses_migration_validator(self):
+        uid = str(os.getuid())
+        runner = ScriptedRunner(successful_existing_commands(uid, DOCKER_VALIDATE_MIGRATION, DOCKER_LAYOUT_DRY_RUN))
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            write_home_env(ctx)
+            write_docker_env(ctx, {**VALID_BASE_ENV, "SUDO_PASSWORD": VALID_SUDO_PASSWORD})
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
+                os.environ,
+                {"LSM_VPS_DOCKER_MODE": "website-migration"},
+                clear=False,
+            ):
+                result = run_docker_hosting_stack(ctx)
+
+        self.assertEqual(result.status, "completed")
+        self.assertIn(DOCKER_VALIDATE_MIGRATION, runner.calls)
+        self.assertNotIn(DOCKER_VALIDATE_BASE, runner.calls)
+
+    def test_repository_selection_persists_docker_capability_before_hardening(self):
+        runner = ScriptedRunner([])
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            ctx.state["selected_modules"] = {}
+            with mock.patch.dict(
+                os.environ,
+                {"LSM_VPS_INIT_MODULES": "docker", "LSM_VPS_DOCKER_MODE": "standalone-app"},
+                clear=False,
+            ):
+                result = run_repository_selection(ctx)
+
+        self.assertEqual(result.status, "completed")
+        self.assertTrue(ctx.state["selected_modules"][DOCKER_MODULE])
+        self.assertEqual(ctx.state["facts"]["docker_hosting_mode"], "standalone-app")
+
+    def test_stage16_reuses_persisted_capability_without_reprompting(self):
+        uid = str(os.getuid())
+        runner = ScriptedRunner(successful_existing_commands(uid, DOCKER_VALIDATE_STANDALONE, DOCKER_LAYOUT_DRY_RUN))
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            ctx.state["facts"]["docker_hosting_mode"] = "standalone-app"
+            write_home_env(ctx)
+            write_docker_env(ctx, {**VALID_INSTANCE_ENV, "SUDO_PASSWORD": VALID_SUDO_PASSWORD})
+            ctx.prompt_secret = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("secret prompted on resume"))
+            ctx.prompt_text = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("text prompted on resume"))
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(os.environ, {}, clear=True):
+                result = run_docker_hosting_stack(ctx)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(ctx.state["facts"]["docker_hosting_mode"], "standalone-app")
+
+    def test_legacy_stage16_resume_reconciles_stale_web_firewall_for_standalone(self):
+        uid = str(os.getuid())
+        runner = ScriptedRunner(
+            [
+                (("ufw", "status", "verbose"), FINAL_UFW_WITH_STALE_WEB),
+                (("ufw", "allow", "65500/tcp"), ""),
+                (("ufw", "status", "verbose"), FINAL_UFW_WITH_STALE_WEB),
+                (("ufw", "status", "verbose"), FINAL_UFW_WITH_STALE_WEB),
+                (("ufw", "delete", "allow", "80/tcp"), ""),
+                (("ufw", "status", "verbose"), FINAL_UFW_WITH_443_ONLY),
+                (("ufw", "status", "verbose"), FINAL_UFW_WITH_443_ONLY),
+                (("ufw", "delete", "allow", "443/tcp"), ""),
+                (("ufw", "status", "verbose"), FINAL_UFW_STANDALONE),
+                (("ufw", "--force", "enable"), ""),
+                (("ufw", "status", "verbose"), FINAL_UFW_STANDALONE),
+                *successful_existing_commands(uid, DOCKER_VALIDATE_STANDALONE, DOCKER_LAYOUT_DRY_RUN),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            set_stage(ctx.state, "final_host_hardening", "completed")
+            write_home_env(ctx)
+            write_docker_env(ctx, {**VALID_INSTANCE_ENV, "SUDO_PASSWORD": VALID_SUDO_PASSWORD})
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
+                os.environ,
+                {"LSM_VPS_DOCKER_MODE": "standalone-app"},
+                clear=False,
+            ):
+                result = run_docker_hosting_stack(ctx)
+
+        self.assertEqual(result.status, "completed")
+        self.assertLess(runner.calls.index(("ufw", "delete", "allow", "80/tcp")), runner.calls.index(DOCKER_CLONE))
+        self.assertLess(runner.calls.index(("ufw", "delete", "allow", "443/tcp")), runner.calls.index(DOCKER_CLONE))
+
     def test_fresh_n8n_prompts_for_required_values_and_runs_validation_after_collection(self):
         uid = str(os.getuid())
         runner = ScriptedRunner(successful_fresh_n8n_commands(uid))

@@ -94,8 +94,13 @@ class PrivilegeSensitiveRunner:
             result = CommandResult(list(args), 0, FINAL_GLOBAL, "")
         elif args == ("sudo", "-n", "sshd", "-T", "-C", SSHD_SADMIN_MATCH_CRITERIA):
             result = CommandResult(list(args), 0, FINAL_SADMIN, "")
-        elif args == ("ufw", "status"):
-            result = CommandResult(list(args), 0, "Status: active\n", "")
+        elif args == ("ufw", "status", "verbose"):
+            result = CommandResult(
+                list(args),
+                0,
+                "Status: active\nDefault: deny (incoming), allow (outgoing), disabled (routed)\n65500/tcp ALLOW IN Anywhere\n",
+                "",
+            )
         else:
             result = CommandResult(list(args), 0, "", "")
         if check and result.returncode != 0:

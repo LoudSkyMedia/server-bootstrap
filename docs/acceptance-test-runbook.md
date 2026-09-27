@@ -939,8 +939,10 @@ wizard already selected this module, resume the final stage:
 sudo lsm-vps-init resume
 ```
 
-When prompted, choose the intended rehearsal mode, for example `base`, `n8n`,
-`standalone-app`, or `website-migration`.
+The Docker Hosting Stack capability is selected during repository selection and
+reused here. Valid server-bootstrap capability names are `base`,
+`standalone-app`, `n8n`, and `website-migration`; `website-migration` maps to
+Docker validator mode `migration`.
 
 Verify the checkout and dry-run evidence:
 
@@ -951,11 +953,25 @@ sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && scripts/valida
 sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && scripts/bootstrap_layout.sh --dry-run'
 ```
 
+For a `standalone-app` rehearsal, validate the standalone contract and confirm
+that final UFW rules do not automatically allow public HTTP/HTTPS:
+
+```bash
+sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && scripts/validate_env.sh --mode standalone-app'
+sudo ufw status verbose
+```
+
 For an `n8n` rehearsal, use the repo-owned dry-run:
 
 ```bash
 sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && scripts/validate_env.sh --mode n8n'
 sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && scripts/install_n8n.sh --dry-run'
+```
+
+For `website-migration`, validate with the Docker stack's migration mode:
+
+```bash
+sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && scripts/validate_env.sh --mode migration'
 ```
 
 Expected result: the private repo is accessible, validation is explicit, and

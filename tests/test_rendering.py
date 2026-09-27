@@ -96,9 +96,23 @@ class RenderingTests(unittest.TestCase):
     def test_firewall_ports_are_capability_derived(self):
         self.assertEqual(firewall_ports_for_modules({}), ["65500/tcp"])
         self.assertEqual(
-            firewall_ports_for_modules({DOCKER_MODULE: True}),
+            firewall_ports_for_modules({DOCKER_MODULE: True}, "standalone-app"),
+            ["65500/tcp"],
+        )
+        self.assertEqual(
+            firewall_ports_for_modules({DOCKER_MODULE: True}, "base"),
             ["65500/tcp", "80/tcp", "443/tcp"],
         )
+        self.assertEqual(
+            firewall_ports_for_modules({DOCKER_MODULE: True}, "n8n"),
+            ["65500/tcp", "80/tcp", "443/tcp"],
+        )
+        self.assertEqual(
+            firewall_ports_for_modules({DOCKER_MODULE: True}, "website-migration"),
+            ["65500/tcp", "80/tcp", "443/tcp"],
+        )
+        with self.assertRaises(Blocked):
+            firewall_ports_for_modules({DOCKER_MODULE: True}, "unknown")
 
     def test_firewall_phase_a_keeps_current_ssh_path(self):
         self.assertEqual(render_ufw_phase_a_plan("22"), ["22/tcp", "65500/tcp"])
