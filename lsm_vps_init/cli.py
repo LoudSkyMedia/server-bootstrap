@@ -27,6 +27,13 @@ def stage_completed_in_state(ctx: Context, slug: str) -> bool:
 
 
 def stage_superseded(ctx: Context, stage) -> bool:
+    predicate = getattr(stage, "superseded_when", None)
+    if predicate is not None:
+        try:
+            if predicate(ctx):
+                return True
+        except (Blocked, Failed, CommandError):
+            pass
     return stage_completed_in_state(ctx, stage.slug) and any(stage_completed_in_state(ctx, slug) for slug in stage.superseded_by)
 
 
@@ -88,6 +95,11 @@ def stage_status(ctx: Context) -> list[dict[str, object]]:
             detector = stage.detect(ctx)
         except Exception as error:  # status must survive local command gaps
             detect_error = str(error)
+        superseded = False
+        try:
+            superseded = stage_superseded(ctx, stage)
+        except Exception as error:  # status must survive local command gaps
+            detect_error = f"{detect_error}; supersession: {error}" if detect_error else f"supersession: {error}"
         rows.append(
             {
                 "index": stage.index,
@@ -95,7 +107,7 @@ def stage_status(ctx: Context) -> list[dict[str, object]]:
                 "title": stage.title,
                 "state_status": record.get("status", "pending"),
                 "detected": detector,
-                "superseded": stage_superseded(ctx, stage),
+                "superseded": superseded,
                 "blocked_reason": record.get("blocked_reason"),
                 "detect_error": detect_error,
             }
@@ -110,7 +122,7 @@ def print_status(ctx: Context, *, as_json: bool = False) -> None:
         (
             row
             for row in rows
-            if row["state_status"] in {"blocked", "failed", "in_progress"}
+            if row["state_status"] in {"blocked", "failed", "in_progress"} and not row["superseded"]
             or (row["state_status"] == "pending" and not row["satisfied"])
         ),
         None,
@@ -121,8 +133,8 @@ def print_status(ctx: Context, *, as_json: bool = False) -> None:
         "current_stage": current["slug"] if current else None,
         "completed": [row["slug"] for row in rows if row["satisfied"]],
         "pending": [row["slug"] for row in rows if not row["satisfied"] and row["state_status"] == "pending"],
-        "blocked": [row for row in rows if row["state_status"] == "blocked"],
-        "failed": [row for row in rows if row["state_status"] == "failed"],
+        "blocked": [row for row in rows if row["state_status"] == "blocked" and not row["superseded"]],
+        "failed": [row for row in rows if row["state_status"] == "failed" and not row["superseded"]],
         "selected_modules": ctx.state.get("selected_modules", {}),
         "checkpoints": ctx.state.get("checkpoints", {}),
         "reboot": ctx.state.get("reboot", {}),
@@ -153,7 +165,7 @@ def print_status(ctx: Context, *, as_json: bool = False) -> None:
     for row in rows:
         marker = "done" if row["satisfied"] else row["state_status"]
         print(f"{row['index']:02d} {row['slug']}: {marker}")
-        if row.get("blocked_reason"):
+        if row.get("blocked_reason") and not row["superseded"]:
             label = "failed" if row["state_status"] == "failed" else "blocked"
             print(f"    {label}: {row['blocked_reason']}")
         if row.get("detect_error"):

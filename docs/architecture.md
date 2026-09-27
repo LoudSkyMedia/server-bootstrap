@@ -145,11 +145,17 @@ Stage completion is either historical or mutable:
 | `docker_hosting_stack` | Mutable | Recheck checkout exists and run repo-owned validation/dry-runs before handoff |
 
 Supersession is lifecycle metadata, not a blanket waiver. After
-`final_host_hardening` completes, the expected final state no longer includes
-SSH port `22` or UFW's temporary `22/tcp` allow rule, so status and resume skip
-the earlier transitional detectors. If the final hardening detector later fails,
-the current stage is `final_host_hardening`, not `ssh_dual_port` or
-`firewall_phase_a`.
+`final_host_hardening` completes, or when live system state authoritatively
+proves the final SSH transition has already happened, the expected SSH state no
+longer includes port `22` or UFW's temporary `22/tcp` allow rule. Status and
+resume therefore skip the earlier transitional SSH/UFW stages instead of
+reopening the old management path. This narrower supersession requires hardened
+effective sshd config, no port-22 listener, a verified port-`65500` recovery
+checkpoint, valid relay prerequisites when selected, active UFW, safe UFW
+defaults, and an allow for `65500/tcp`; it does not require capability-specific
+Docker web-ingress cleanup to be complete. If final hardening still needs to
+remove stale managed web rules, the current stage is `final_host_hardening`, not
+`ssh_dual_port` or `firewall_phase_a`.
 
 Immediately before `final_host_hardening`, the wizard revalidates current sshd
 config/listeners, UFW Phase A, relay health when selected, and Docker
@@ -317,8 +323,10 @@ That same capability controls final inbound firewall rules. Management SSH on
 `65500/tcp` is always retained. `base`, `n8n`, and `website-migration` retain
 public `80/tcp` and `443/tcp` for their public web workflows; `standalone-app`
 does not automatically imply public HTTP/HTTPS ingress. If a legacy state
-completed Stage 15 before the capability was recorded, Stage 16 records the
-capability and reconciles stale managed web allows before final completion.
+completed Stage 15 before the capability was recorded, or later marked Stage 15
+blocked/failed even though SSH was already final-hardened, resume does not replay
+the temporary port-22 transition. Stage 15 records the capability when needed and
+reconciles stale managed web allows before final completion.
 
 ## Release Trust
 

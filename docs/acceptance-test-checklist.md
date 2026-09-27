@@ -70,6 +70,7 @@ VPS.
 - [ ] Root SSH fails after final hardening.
 - [ ] Actual listeners inspected; no unexpected public ports are exposed.
 - [ ] Docker Engine is not exposed on TCP `2375` or `2376`.
+- [ ] A post-hardening resume does not re-enable SSH port `22` or `22/tcp` UFW access.
 - [ ] Reboot after final hardening completed.
 - [ ] Post-final-reboot SSH works on `65500`.
 - [ ] Post-final-reboot SSH on `22` remains unavailable.

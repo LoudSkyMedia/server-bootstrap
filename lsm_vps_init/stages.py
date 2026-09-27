@@ -534,6 +534,7 @@ class StageDefinition:
     detect: Callable[["Context"], bool]
     run: Callable[["Context"], StageResult]
     superseded_by: tuple[str, ...] = ()
+    superseded_when: Callable[["Context"], bool] | None = None
 
 
 @dataclass
@@ -889,9 +890,7 @@ def final_ufw_baseline_issues(status_text: str) -> list[str]:
     return issues
 
 
-def try_reconcile_already_hardened_final_firewall(ctx: Context, mode: str) -> bool:
-    if ctx.dry_run:
-        return False
+def final_ssh_transition_issues_with_ufw_status(ctx: Context) -> tuple[list[str], str]:
     issues = current_final_ssh_hardening_issues(ctx)
     status_result = ctx.runner.run(["ufw", "status", "verbose"], check=False)
     if status_result.returncode != 0:
@@ -900,6 +899,22 @@ def try_reconcile_already_hardened_final_firewall(ctx: Context, mode: str) -> bo
     else:
         status_text = status_result.stdout
         issues.extend(final_ufw_baseline_issues(status_text))
+    return issues, status_text
+
+
+def final_ssh_transition_issues(ctx: Context) -> list[str]:
+    issues, _status_text = final_ssh_transition_issues_with_ufw_status(ctx)
+    return issues
+
+
+def final_ssh_transition_already_applied(ctx: Context) -> bool:
+    return not final_ssh_transition_issues(ctx)
+
+
+def try_reconcile_already_hardened_final_firewall(ctx: Context, mode: str) -> bool:
+    if ctx.dry_run:
+        return False
+    issues, status_text = final_ssh_transition_issues_with_ufw_status(ctx)
     issues.extend(docker_published_port_issues(ctx))
     if issues:
         return False
@@ -2744,8 +2759,24 @@ STAGES: list[StageDefinition] = [
     StageDefinition(2, "root_password", "Reset root password", detect_root_password, run_root_password),
     StageDefinition(3, "sadmin_user", "Create sadmin", detect_sadmin, run_sadmin),
     StageDefinition(4, "sadmin_ssh_key", "Install sadmin SSH public key", detect_sadmin_ssh_key, run_sadmin_ssh_key),
-    StageDefinition(5, "ssh_dual_port", "Add SSH port 65500 while preserving 22", detect_ssh_dual_port, run_ssh_dual_port, ("final_host_hardening",)),
-    StageDefinition(6, "firewall_phase_a", "Enable UFW with both SSH ports", detect_firewall_phase_a, run_firewall_phase_a, ("final_host_hardening",)),
+    StageDefinition(
+        5,
+        "ssh_dual_port",
+        "Add SSH port 65500 while preserving 22",
+        detect_ssh_dual_port,
+        run_ssh_dual_port,
+        ("final_host_hardening",),
+        final_ssh_transition_already_applied,
+    ),
+    StageDefinition(
+        6,
+        "firewall_phase_a",
+        "Enable UFW with both SSH ports",
+        detect_firewall_phase_a,
+        run_firewall_phase_a,
+        ("final_host_hardening",),
+        final_ssh_transition_already_applied,
+    ),
     StageDefinition(7, "ssh_recovery_checkpoint", "Verify new SSH recovery path", detect_ssh_recovery, run_ssh_recovery),
     StageDefinition(8, "management_tooling", "Install management tooling", detect_management_tooling, run_management_tooling),
     StageDefinition(9, "github_auth", "Authenticate GitHub as sadmin", detect_github_auth, run_github_auth),

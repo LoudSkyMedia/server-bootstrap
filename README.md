@@ -302,6 +302,13 @@ effective config with `sshd -T`, and refuses to continue if the verified
 recovery path is missing. Temporary OpenSSH `ExposeAuthInfo` proof
 instrumentation is scoped to `sadmin` and is removed during final hardening.
 
+After final SSH hardening has been proven from live system state, later resumes
+must not return the host to the temporary dual-port or UFW Phase-A posture merely
+because bootstrap state is stale. A legacy resume may still run Stage 15 to
+reconcile capability-specific firewall rules, such as removing stale managed
+`80/tcp` and `443/tcp` allows for `standalone-app`, but it must keep port `22`
+closed.
+
 ## Resumability / Recovery
 
 State and logs live at:
