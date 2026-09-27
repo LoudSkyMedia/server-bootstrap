@@ -12,6 +12,8 @@ from lsm_vps_init.stages import (
     SSH_PORT,
     Blocked,
     Context,
+    DOCKER_MODULE,
+    RELAY_MODULE,
     Failed,
     StageDefinition,
     StageResult,
@@ -35,6 +37,32 @@ FINAL_GLOBAL = (
     "pubkeyauthentication yes\n"
 )
 FINAL_SADMIN = FINAL_GLOBAL + "exposeauthinfo no\n"
+SSH_65500_LISTENER = "LISTEN 0 128 0.0.0.0:65500 0.0.0.0:*\n"
+FINAL_UFW_WITH_STALE_WEB = (
+    "Status: active\n"
+    "Default: deny (incoming), allow (outgoing), disabled (routed)\n"
+    "65500/tcp ALLOW IN Anywhere\n"
+    "80/tcp ALLOW IN Anywhere\n"
+    "443/tcp ALLOW IN Anywhere\n"
+)
+FINAL_UFW_WITH_443_ONLY = (
+    "Status: active\n"
+    "Default: deny (incoming), allow (outgoing), disabled (routed)\n"
+    "65500/tcp ALLOW IN Anywhere\n"
+    "443/tcp ALLOW IN Anywhere\n"
+)
+FINAL_UFW_STANDALONE = (
+    "Status: active\n"
+    "Default: deny (incoming), allow (outgoing), disabled (routed)\n"
+    "65500/tcp ALLOW IN Anywhere\n"
+)
+FINAL_UFW_PUBLIC_WEB = (
+    "Status: active\n"
+    "Default: deny (incoming), allow (outgoing), disabled (routed)\n"
+    "65500/tcp ALLOW IN Anywhere\n"
+    "80/tcp ALLOW IN Anywhere\n"
+    "443/tcp ALLOW IN Anywhere\n"
+)
 
 
 def first_value_effective_keywords(config_dir: Path) -> dict[str, str]:
@@ -116,6 +144,38 @@ def context(tmp, runner) -> Context:
     state["selected_modules"]["codex-vps-discord-relay"] = False
     state["selected_modules"]["docker-hosting-stack"] = False
     return Context(layout=layout, state=state, runner=runner, dry_run=False, assume_yes=True)
+
+
+def enable_docker_mode(ctx: Context, mode: str) -> None:
+    ctx.state["selected_modules"][DOCKER_MODULE] = True
+    ctx.state["facts"]["docker_hosting_mode"] = mode
+
+
+def already_hardened_probe_responses(ufw_status: str = FINAL_UFW_STANDALONE, *, docker_available: bool = False):
+    docker_result = CommandResult([], 0 if docker_available else 1, "", "")
+    return [
+        (("sudo", "-n", "sshd", "-T"), FINAL_GLOBAL),
+        (("sudo", "-n", "sshd", "-T", "-C", SSHD_SADMIN_MATCH_CRITERIA), FINAL_SADMIN),
+        (("ss", "-tln"), SSH_65500_LISTENER),
+        (("ss", "-tln"), SSH_65500_LISTENER),
+        (("ufw", "status", "verbose"), ufw_status),
+        (("bash", "-lc", "command -v docker >/dev/null"), docker_result),
+    ]
+
+
+def standalone_reconcile_responses():
+    return [
+        (("ufw", "allow", "65500/tcp"), ""),
+        (("ufw", "status", "verbose"), FINAL_UFW_WITH_STALE_WEB),
+        (("ufw", "status", "verbose"), FINAL_UFW_WITH_STALE_WEB),
+        (("ufw", "delete", "allow", "80/tcp"), ""),
+        (("ufw", "status", "verbose"), FINAL_UFW_WITH_443_ONLY),
+        (("ufw", "status", "verbose"), FINAL_UFW_WITH_443_ONLY),
+        (("ufw", "delete", "allow", "443/tcp"), ""),
+        (("ufw", "status", "verbose"), FINAL_UFW_STANDALONE),
+        (("ufw", "--force", "enable"), ""),
+        (("ufw", "status", "verbose"), FINAL_UFW_STANDALONE),
+    ]
 
 
 class SshdPrivilegeTests(unittest.TestCase):
@@ -274,6 +334,159 @@ class SshdPrivilegeTests(unittest.TestCase):
                     run_final_host_hardening(ctx)
         self.assertIn("PasswordAuthentication", str(caught.exception))
         self.assertNotIn(("systemctl", "daemon-reload"), runner.calls)
+
+    def test_legacy_already_hardened_standalone_reconciles_stale_web_rules_without_reopening_22(self):
+        runner = ScriptedRunner(
+            [
+                *already_hardened_probe_responses(FINAL_UFW_WITH_STALE_WEB),
+                *standalone_reconcile_responses(),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = context(tmp, runner)
+            enable_docker_mode(ctx, "standalone-app")
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0):
+                result = run_final_host_hardening(ctx)
+
+            detect_runner = ScriptedRunner(
+                [
+                    (("sudo", "-n", "sshd", "-T"), FINAL_GLOBAL),
+                    (("sudo", "-n", "sshd", "-T", "-C", SSHD_SADMIN_MATCH_CRITERIA), FINAL_SADMIN),
+                    (("ufw", "status", "verbose"), FINAL_UFW_STANDALONE),
+                ]
+            )
+            ctx.runner = detect_runner
+            self.assertTrue(detect_final_host_hardening(ctx))
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.evidence, {"firewall_ports": ["65500/tcp"]})
+        self.assertIn(("ufw", "delete", "allow", "80/tcp"), runner.calls)
+        self.assertIn(("ufw", "delete", "allow", "443/tcp"), runner.calls)
+        self.assertNotIn(("ufw", "allow", "22/tcp"), runner.calls)
+        self.assertNotIn(("apt-get", "install", "-y", "ufw", "fail2ban", "unattended-upgrades"), runner.calls)
+        self.assertNotIn(("sudo", "-n", "sshd", "-t"), runner.calls)
+
+    def test_legacy_already_hardened_public_web_modes_retain_80_and_443(self):
+        for mode in ("base", "n8n", "website-migration"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                runner = ScriptedRunner(already_hardened_probe_responses(FINAL_UFW_PUBLIC_WEB))
+                ctx = context(tmp, runner)
+                enable_docker_mode(ctx, mode)
+                with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0):
+                    result = run_final_host_hardening(ctx)
+
+                self.assertEqual(result.status, "completed")
+                self.assertEqual(result.evidence, {"firewall_ports": ["65500/tcp", "80/tcp", "443/tcp"]})
+                self.assertNotIn(("ufw", "delete", "allow", "80/tcp"), runner.calls)
+                self.assertNotIn(("ufw", "delete", "allow", "443/tcp"), runner.calls)
+                self.assertNotIn(("ufw", "allow", "22/tcp"), runner.calls)
+
+    def test_pre_hardening_host_still_requires_phase_a(self):
+        dual_global = (
+            "port 22\n"
+            f"port {SSH_PORT}\n"
+            "permitrootlogin no\n"
+            "passwordauthentication no\n"
+            "pubkeyauthentication yes\n"
+        )
+        dual_sadmin = dual_global + "exposeauthinfo yes\n"
+        dual_listener = "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n" + SSH_65500_LISTENER
+        runner = ScriptedRunner(
+            [
+                (("sudo", "-n", "sshd", "-T"), dual_global),
+                (("sudo", "-n", "sshd", "-T", "-C", SSHD_SADMIN_MATCH_CRITERIA), dual_sadmin),
+                (("ss", "-tln"), dual_listener),
+                (("ss", "-tln"), dual_listener),
+                (("ufw", "status", "verbose"), FINAL_UFW_STANDALONE),
+                (("bash", "-lc", "command -v docker >/dev/null"), CommandResult([], 1, "", "")),
+                (("sudo", "-n", "sshd", "-T"), dual_global),
+                (("ss", "-tln"), dual_listener),
+                (("ufw", "status", "verbose"), FINAL_UFW_STANDALONE),
+                (("bash", "-lc", "command -v docker >/dev/null"), CommandResult([], 1, "", "")),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = context(tmp, runner)
+            enable_docker_mode(ctx, "standalone-app")
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0):
+                with self.assertRaises(Blocked) as caught:
+                    run_final_host_hardening(ctx)
+        self.assertIn("UFW Phase A is not currently active", str(caught.exception))
+        self.assertNotIn(("ufw", "allow", "22/tcp"), runner.calls)
+
+    def test_badly_hardened_ssh_state_does_not_take_legacy_firewall_shortcut(self):
+        bad_global = (
+            f"port {SSH_PORT}\n"
+            "permitrootlogin no\n"
+            "passwordauthentication yes\n"
+            "pubkeyauthentication yes\n"
+        )
+        runner = ScriptedRunner(
+            [
+                (("sudo", "-n", "sshd", "-T"), bad_global),
+                (("sudo", "-n", "sshd", "-T", "-C", SSHD_SADMIN_MATCH_CRITERIA), FINAL_SADMIN),
+                (("ss", "-tln"), SSH_65500_LISTENER),
+                (("ss", "-tln"), SSH_65500_LISTENER),
+                (("ufw", "status", "verbose"), FINAL_UFW_WITH_STALE_WEB),
+                (("bash", "-lc", "command -v docker >/dev/null"), CommandResult([], 1, "", "")),
+                (("sudo", "-n", "sshd", "-T"), bad_global),
+                (("ss", "-tln"), SSH_65500_LISTENER),
+                (("ufw", "status", "verbose"), FINAL_UFW_WITH_STALE_WEB),
+                (("bash", "-lc", "command -v docker >/dev/null"), CommandResult([], 1, "", "")),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = context(tmp, runner)
+            enable_docker_mode(ctx, "standalone-app")
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0):
+                with self.assertRaises(Blocked) as caught:
+                    run_final_host_hardening(ctx)
+        self.assertIn("UFW Phase A is not currently active", str(caught.exception))
+        self.assertNotIn(("ufw", "delete", "allow", "80/tcp"), runner.calls)
+        self.assertNotIn(("ufw", "allow", "22/tcp"), runner.calls)
+
+    def test_missing_ssh_recovery_proof_prevents_legacy_firewall_reconciliation(self):
+        runner = ScriptedRunner(
+            [
+                *already_hardened_probe_responses(FINAL_UFW_WITH_STALE_WEB),
+                (("sudo", "-n", "sshd", "-T"), FINAL_GLOBAL),
+                (("ss", "-tln"), SSH_65500_LISTENER),
+                (("ufw", "status", "verbose"), FINAL_UFW_WITH_STALE_WEB),
+                (("bash", "-lc", "command -v docker >/dev/null"), CommandResult([], 1, "", "")),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = context(tmp, runner)
+            ctx.state["checkpoints"]["ssh_recovery_verified"] = False
+            enable_docker_mode(ctx, "standalone-app")
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0):
+                with self.assertRaises(Blocked) as caught:
+                    run_final_host_hardening(ctx)
+        self.assertIn("sadmin SSH recovery checkpoint is not verified", str(caught.exception))
+        self.assertNotIn(("ufw", "delete", "allow", "80/tcp"), runner.calls)
+        self.assertNotIn(("ufw", "allow", "22/tcp"), runner.calls)
+
+    def test_selected_relay_requirements_block_legacy_firewall_reconciliation(self):
+        runner = ScriptedRunner(
+            [
+                *already_hardened_probe_responses(FINAL_UFW_WITH_STALE_WEB),
+                (("sudo", "-n", "sshd", "-T"), FINAL_GLOBAL),
+                (("ss", "-tln"), SSH_65500_LISTENER),
+                (("ufw", "status", "verbose"), FINAL_UFW_WITH_STALE_WEB),
+                (("bash", "-lc", "command -v docker >/dev/null"), CommandResult([], 1, "", "")),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = context(tmp, runner)
+            ctx.state["selected_modules"][RELAY_MODULE] = True
+            ctx.state["checkpoints"]["relay_round_trip_verified"] = False
+            enable_docker_mode(ctx, "standalone-app")
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0):
+                with self.assertRaises(Blocked) as caught:
+                    run_final_host_hardening(ctx)
+        self.assertIn("Discord/Codex relay round trip is not verified", str(caught.exception))
+        self.assertNotIn(("ufw", "delete", "allow", "80/tcp"), runner.calls)
+        self.assertNotIn(("ufw", "allow", "22/tcp"), runner.calls)
 
     def test_ssh_recovery_checkpoint_still_requires_65500_key_only_sadmin_session(self):
         valid_env = {

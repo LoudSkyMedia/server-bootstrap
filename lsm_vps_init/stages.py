@@ -812,17 +812,105 @@ def reconcile_ufw_final_rules(ctx: Context, required_ports: list[str]) -> None:
     validate_final_ufw_status(status, required_ports)
 
 
-def reconcile_completed_final_firewall(ctx: Context, mode: str) -> None:
-    if ctx.dry_run or ctx.state.get("stages", {}).get("final_host_hardening", {}).get("status") != "completed":
+def reconcile_legacy_final_firewall(ctx: Context, mode: str) -> None:
+    stage_status = ctx.state.get("stages", {}).get("final_host_hardening", {}).get("status")
+    if stage_status not in {"completed", "blocked", "failed", "in_progress"}:
         return
-    ports = firewall_ports_for_modules(ctx.state.get("selected_modules", {}), mode)
-    status = ctx.runner.run(["ufw", "status", "verbose"], check=False).stdout
+    try_reconcile_already_hardened_final_firewall(ctx, mode)
+
+
+def selected_relay_requirements_issues(ctx: Context) -> list[str]:
+    issues: list[str] = []
+    if ctx.state.get("selected_modules", {}).get(RELAY_MODULE):
+        if not ctx.state.get("checkpoints", {}).get("relay_round_trip_verified"):
+            issues.append("Discord/Codex relay round trip is not verified")
+        if ctx.state.get("stages", {}).get("discord_relay_install", {}).get("status") != "completed":
+            issues.append("Discord relay install stage is not completed")
+        elif not ctx.dry_run and not detect_discord_relay_install(ctx):
+            issues.append("Discord relay service/preflight is not currently healthy")
+    return issues
+
+
+def docker_published_port_issues(ctx: Context) -> list[str]:
+    if ctx.dry_run:
+        return []
+    issues: list[str] = []
+    docker_available = ctx.runner.run(["bash", "-lc", "command -v docker >/dev/null"], check=False).returncode == 0
+    if docker_available:
+        result = ctx.runner.run(["docker", "ps", "--format", "{{.Names}}\t{{.Ports}}"], check=False)
+        if result.returncode == 0:
+            published = parse_docker_published_ports(result.stdout)
+            allowed: set[int] = set()
+            if ctx.state.get("selected_modules", {}).get(DOCKER_MODULE):
+                mode = selected_docker_hosting_mode(ctx)
+                if mode and docker_hosting_mode_requires_web_ingress(mode):
+                    allowed = {80, 443}
+            unexpected = published - allowed
+            if unexpected:
+                issues.append(f"Docker has unexpected host-published public port(s): {', '.join(str(port) for port in sorted(unexpected))}")
+        else:
+            issues.append("Docker is installed but published-port inspection failed")
+    return issues
+
+
+def current_final_ssh_hardening_issues(ctx: Context) -> list[str]:
+    issues: list[str] = []
+    result = sshd_global_effective_config(ctx, check=False)
+    if result.returncode != 0:
+        issues.append("effective sshd config could not be read")
+        return issues
+    sadmin_result = sshd_effective_for_sadmin_result(ctx, check=False)
+    if sadmin_result.returncode != 0:
+        issues.append("effective sadmin sshd config could not be read")
+        return issues
     try:
-        validate_final_ufw_status(status, ports)
-        return
+        validate_final_sshd_effective_config(result.stdout, sadmin_result.stdout)
+    except Failed as error:
+        issues.append(str(error))
+    if not ssh_listener_present(ctx, SSH_PORT):
+        issues.append(f"sshd is not currently listening on port {SSH_PORT}")
+    if ssh_listener_present(ctx, "22"):
+        issues.append("sshd is still listening on port 22")
+    if not ctx.state.get("checkpoints", {}).get("ssh_recovery_verified"):
+        issues.append("sadmin SSH recovery checkpoint is not verified")
+    issues.extend(selected_relay_requirements_issues(ctx))
+    return issues
+
+
+def final_ufw_baseline_issues(status_text: str) -> list[str]:
+    issues: list[str] = []
+    if not ufw_status_is_active(status_text):
+        issues.append("UFW is not active")
+    if not ufw_status_defaults_are_safe(status_text):
+        issues.append("UFW default policy is not deny incoming / allow outgoing")
+    management_port = f"{SSH_PORT}/tcp"
+    if not ufw_status_allows(status_text, management_port):
+        issues.append(f"UFW is missing required management allow rule: {management_port}")
+    return issues
+
+
+def try_reconcile_already_hardened_final_firewall(ctx: Context, mode: str) -> bool:
+    if ctx.dry_run:
+        return False
+    issues = current_final_ssh_hardening_issues(ctx)
+    status_result = ctx.runner.run(["ufw", "status", "verbose"], check=False)
+    if status_result.returncode != 0:
+        issues.append("UFW status could not be read")
+        status_text = ""
+    else:
+        status_text = status_result.stdout
+        issues.extend(final_ufw_baseline_issues(status_text))
+    issues.extend(docker_published_port_issues(ctx))
+    if issues:
+        return False
+
+    required_ports = firewall_ports_for_modules(ctx.state.get("selected_modules", {}), mode)
+    try:
+        validate_final_ufw_status(status_text, required_ports)
+        return True
     except Failed:
-        pass
-    reconcile_ufw_final_rules(ctx, ports)
+        reconcile_ufw_final_rules(ctx, required_ports)
+        return True
 
 
 def codex_reasoning_config_arg(reasoning: str = REQUIRED_CODEX_REASONING) -> str:
@@ -1329,31 +1417,10 @@ def revalidate_before_final_hardening(ctx: Context) -> None:
         issues.append(f"sshd is not currently listening on port {SSH_PORT}")
     if not ctx.state.get("checkpoints", {}).get("ssh_recovery_verified"):
         issues.append("sadmin SSH recovery checkpoint is not verified")
-    if ctx.state.get("selected_modules", {}).get(RELAY_MODULE):
-        if not ctx.state.get("checkpoints", {}).get("relay_round_trip_verified"):
-            issues.append("Discord/Codex relay round trip is not verified")
-        if ctx.state.get("stages", {}).get("discord_relay_install", {}).get("status") != "completed":
-            issues.append("Discord relay install stage is not completed")
-        elif not ctx.dry_run and not detect_discord_relay_install(ctx):
-            issues.append("Discord relay service/preflight is not currently healthy")
+    issues.extend(selected_relay_requirements_issues(ctx))
     if not ctx.dry_run and not detect_firewall_phase_a(ctx):
         issues.append("UFW Phase A is not currently active with both 22/tcp and 65500/tcp allowed")
-    if not ctx.dry_run:
-        docker_available = ctx.runner.run(["bash", "-lc", "command -v docker >/dev/null"], check=False).returncode == 0
-        if docker_available:
-            result = ctx.runner.run(["docker", "ps", "--format", "{{.Names}}\t{{.Ports}}"], check=False)
-            if result.returncode == 0:
-                published = parse_docker_published_ports(result.stdout)
-                allowed: set[int] = set()
-                if ctx.state.get("selected_modules", {}).get(DOCKER_MODULE):
-                    mode = selected_docker_hosting_mode(ctx)
-                    if mode and docker_hosting_mode_requires_web_ingress(mode):
-                        allowed = {80, 443}
-                unexpected = published - allowed
-                if unexpected:
-                    issues.append(f"Docker has unexpected host-published public port(s): {', '.join(str(port) for port in sorted(unexpected))}")
-            else:
-                issues.append("Docker is installed but published-port inspection failed")
+    issues.extend(docker_published_port_issues(ctx))
     if issues:
         raise Blocked("Refusing final hardening until current conditions are fixed: " + "; ".join(issues))
 
@@ -2250,16 +2317,19 @@ def detect_final_host_hardening(ctx: Context) -> bool:
 def run_final_host_hardening(ctx: Context) -> StageResult:
     ctx.require_root()
     stage_intro(ctx, "final_host_hardening")
+    mode: str | None = None
     if ctx.state.get("selected_modules", {}).get(DOCKER_MODULE):
-        resolve_docker_hosting_mode(ctx, prompt=True)
+        mode = resolve_docker_hosting_mode(ctx, prompt=True)
+    ports = firewall_ports_for_state(ctx)
     if ctx.dry_run and not ctx.layout.mock_root:
         if not ctx.state.get("checkpoints", {}).get("ssh_recovery_verified"):
             raise Blocked("Refusing hardening: sadmin SSH recovery on port 65500 is not verified.")
         if ctx.state.get("selected_modules", {}).get(RELAY_MODULE) and not ctx.state.get("checkpoints", {}).get("relay_round_trip_verified"):
             raise Blocked("Refusing hardening: Discord/Codex relay round trip is not verified.")
     else:
+        if mode and try_reconcile_already_hardened_final_firewall(ctx, mode):
+            return StageResult("completed", "Final host hardening already applied; reconciled capability-specific firewall rules.", {"firewall_ports": ports})
         revalidate_before_final_hardening(ctx)
-    ports = firewall_ports_for_state(ctx)
     plan = "\n".join(
         [
             "Final hardening plan:",
@@ -2637,7 +2707,7 @@ def run_docker_hosting_stack(ctx: Context) -> StageResult:
         )
     mode = resolve_docker_hosting_mode(ctx, prompt=True)
     validation_mode = docker_hosting_validator_mode(mode)
-    reconcile_completed_final_firewall(ctx, mode)
+    reconcile_legacy_final_firewall(ctx, mode)
     clone_script = (
         "if [ -d /home/sadmin/docker-hosting-stack/.git ]; then "
         "cd /home/sadmin/docker-hosting-stack && git pull --ff-only; "

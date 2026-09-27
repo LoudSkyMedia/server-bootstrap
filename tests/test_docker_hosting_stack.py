@@ -11,6 +11,8 @@ from lsm_vps_init.stages import (
     DOCKER_HOSTING_VALIDATOR_MODES,
     DOCKER_HOSTING_REPO,
     DOCKER_MODULE,
+    SSHD_SADMIN_MATCH_CRITERIA,
+    SSH_PORT,
     Blocked,
     Context,
     docker_n8n_env_updates,
@@ -89,6 +91,14 @@ FINAL_UFW_STANDALONE = (
     "Default: deny (incoming), allow (outgoing), disabled (routed)\n"
     "65500/tcp ALLOW IN Anywhere\n"
 )
+FINAL_GLOBAL = (
+    f"port {SSH_PORT}\n"
+    "permitrootlogin no\n"
+    "passwordauthentication no\n"
+    "pubkeyauthentication yes\n"
+)
+FINAL_SADMIN = FINAL_GLOBAL + "exposeauthinfo no\n"
+SSH_65500_LISTENER = "LISTEN 0 128 0.0.0.0:65500 0.0.0.0:*\n"
 
 
 class PromptRecorder:
@@ -343,7 +353,12 @@ class DockerHostingStackTests(unittest.TestCase):
         uid = str(os.getuid())
         runner = ScriptedRunner(
             [
+                (("sudo", "-n", "sshd", "-T"), FINAL_GLOBAL),
+                (("sudo", "-n", "sshd", "-T", "-C", SSHD_SADMIN_MATCH_CRITERIA), FINAL_SADMIN),
+                (("ss", "-tln"), SSH_65500_LISTENER),
+                (("ss", "-tln"), SSH_65500_LISTENER),
                 (("ufw", "status", "verbose"), FINAL_UFW_WITH_STALE_WEB),
+                (("bash", "-lc", "command -v docker >/dev/null"), CommandResult([], 1, "", "")),
                 (("ufw", "allow", "65500/tcp"), ""),
                 (("ufw", "status", "verbose"), FINAL_UFW_WITH_STALE_WEB),
                 (("ufw", "status", "verbose"), FINAL_UFW_WITH_STALE_WEB),
@@ -359,7 +374,8 @@ class DockerHostingStackTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             ctx = make_context(tmp, runner)
-            set_stage(ctx.state, "final_host_hardening", "completed")
+            ctx.state["checkpoints"]["ssh_recovery_verified"] = True
+            set_stage(ctx.state, "final_host_hardening", "blocked", "legacy stale web rules")
             write_home_env(ctx)
             write_docker_env(ctx, {**VALID_INSTANCE_ENV, "SUDO_PASSWORD": VALID_SUDO_PASSWORD})
             with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
@@ -372,6 +388,7 @@ class DockerHostingStackTests(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertLess(runner.calls.index(("ufw", "delete", "allow", "80/tcp")), runner.calls.index(DOCKER_CLONE))
         self.assertLess(runner.calls.index(("ufw", "delete", "allow", "443/tcp")), runner.calls.index(DOCKER_CLONE))
+        self.assertNotIn(("ufw", "allow", "22/tcp"), runner.calls)
 
     def test_fresh_n8n_prompts_for_required_values_and_runs_validation_after_collection(self):
         uid = str(os.getuid())
