@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import stat
 import tempfile
 import unittest
@@ -11,10 +12,13 @@ from lsm_vps_init.stages import (
     DOCKER_HOSTING_VALIDATOR_MODES,
     DOCKER_HOSTING_REPO,
     DOCKER_MODULE,
+    DOCKER_HOST_PREPARE_APPLY_COMMAND,
+    DOCKER_HOST_PREPARE_DRY_RUN_COMMAND,
     SSHD_SADMIN_MATCH_CRITERIA,
     SSH_PORT,
     Blocked,
     Context,
+    detect_docker_hosting_stack,
     docker_n8n_env_updates,
     docker_existing_value_valid,
     docker_hosting_validator_mode,
@@ -49,6 +53,14 @@ DOCKER_VALIDATE_N8N = sadmin_args("cd /home/sadmin/docker-hosting-stack && scrip
 DOCKER_VALIDATE_MIGRATION = sadmin_args("cd /home/sadmin/docker-hosting-stack && scripts/validate_env.sh --mode migration")
 DOCKER_LAYOUT_DRY_RUN = sadmin_args("cd /home/sadmin/docker-hosting-stack && scripts/bootstrap_layout.sh --dry-run")
 DOCKER_INSTALL_N8N_DRY_RUN = sadmin_args("cd /home/sadmin/docker-hosting-stack && scripts/install_n8n.sh --dry-run")
+DOCKER_PREPARE_DRY_RUN = sadmin_args(f"cd /home/sadmin/docker-hosting-stack && {DOCKER_HOST_PREPARE_DRY_RUN_COMMAND}")
+DOCKER_PREPARE_APPLY = sadmin_args(f"cd /home/sadmin/docker-hosting-stack && {DOCKER_HOST_PREPARE_APPLY_COMMAND}")
+DOCKER_COMMAND_EXISTS = ("bash", "-lc", "command -v docker >/dev/null")
+DOCKER_VERSION = ("docker", "version")
+DOCKER_COMPOSE_VERSION = ("docker", "compose", "version")
+DOCKER_SERVICE_ENABLED = ("systemctl", "is-enabled", "docker")
+DOCKER_SERVICE_ACTIVE = ("systemctl", "is-active", "docker")
+DOCKER_TCP_LISTENERS = ("ss", "-H", "-ltnp")
 
 
 VALID_INSTANCE_ENV = {
@@ -132,6 +144,8 @@ class PromptRecorder:
 
     def confirm(self, prompt, *, default=False):
         self.confirm_prompts.append(prompt)
+        if "Docker Hosting Stack Docker host preparation" in prompt:
+            return True
         return default
 
 
@@ -169,7 +183,13 @@ def make_context(tmp, runner):
     state["selected_modules"][DOCKER_MODULE] = True
     state["facts"]["instance_name"] = VALID_INSTANCE_ENV["INSTANCE_NAME"]
     state["facts"]["public_ipv4"] = VALID_INSTANCE_ENV["SERVER_PUBLIC_IPV4"]
-    return Context(layout=layout, state=state, runner=runner, dry_run=False)
+    write_runtime_layout(layout)
+    return Context(layout=layout, state=state, runner=runner, dry_run=False, assume_yes=True)
+
+
+def write_runtime_layout(layout):
+    for path in ("/srv/hosting", "/srv/hosting/apps", "/srv/hosting/secrets"):
+        layout.map(path).mkdir(parents=True, exist_ok=True)
 
 
 def write_docker_env(ctx, values, *, mode=0o600):
@@ -196,6 +216,7 @@ def successful_fresh_n8n_commands(uid):
         (DOCKER_CHOWN_ENV, ""),
         (DOCKER_AUDIT, ""),
         (DOCKER_VALIDATE_N8N, ""),
+        *docker_preparation_commands(),
         (DOCKER_INSTALL_N8N_DRY_RUN, ""),
     ]
 
@@ -207,6 +228,7 @@ def successful_existing_n8n_commands(uid):
         (("id", "-u", "sadmin"), uid),
         (DOCKER_AUDIT, ""),
         (DOCKER_VALIDATE_N8N, ""),
+        *docker_preparation_commands(),
         (DOCKER_INSTALL_N8N_DRY_RUN, ""),
     ]
 
@@ -218,7 +240,31 @@ def successful_existing_commands(uid, validate_command, dry_run_command):
         (("id", "-u", "sadmin"), uid),
         (DOCKER_AUDIT, ""),
         (validate_command, ""),
+        *docker_preparation_commands(),
         (dry_run_command, ""),
+    ]
+
+
+def docker_preparation_commands(
+    *,
+    dry_run_result="Docker host preparation plan:\n",
+    apply_result="Docker host preparation validation passed.\n",
+    command_exists_result="",
+    docker_version_result="Client: Docker Engine\nServer: Docker Engine\n",
+    compose_version_result="Docker Compose version v2.29.7\n",
+    service_enabled_result="enabled\n",
+    service_active_result="active\n",
+    tcp_listener_result="",
+):
+    return [
+        (DOCKER_PREPARE_DRY_RUN, dry_run_result),
+        (DOCKER_PREPARE_APPLY, apply_result),
+        (DOCKER_COMMAND_EXISTS, command_exists_result),
+        (DOCKER_VERSION, docker_version_result),
+        (DOCKER_COMPOSE_VERSION, compose_version_result),
+        (DOCKER_SERVICE_ENABLED, service_enabled_result),
+        (DOCKER_SERVICE_ACTIVE, service_active_result),
+        (DOCKER_TCP_LISTENERS, tcp_listener_result),
     ]
 
 
@@ -238,6 +284,17 @@ class DockerHostingStackTests(unittest.TestCase):
         with self.assertRaises(Blocked):
             docker_hosting_validator_mode("unknown-mode")
 
+    def test_docker_module_not_selected_does_not_prepare_docker(self):
+        runner = ScriptedRunner([])
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            ctx.state["selected_modules"][DOCKER_MODULE] = False
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0):
+                result = run_docker_hosting_stack(ctx)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(runner.calls, [])
+
     def test_sudo_password_is_not_rejected_as_placeholder_text(self):
         self.assertTrue(docker_existing_value_valid("SUDO_PASSWORD", "example-vps"))
         self.assertTrue(docker_existing_value_valid("SUDO_PASSWORD", "203.0.113.10"))
@@ -252,6 +309,7 @@ class DockerHostingStackTests(unittest.TestCase):
                 (DOCKER_CHOWN_ENV, ""),
                 (DOCKER_AUDIT, ""),
                 (DOCKER_VALIDATE_STANDALONE, ""),
+                *docker_preparation_commands(),
                 (DOCKER_LAYOUT_DRY_RUN, ""),
             ]
         )
@@ -277,6 +335,10 @@ class DockerHostingStackTests(unittest.TestCase):
         self.assertEqual(parse_env_value(written, "INSTANCE_NAME"), VALID_INSTANCE_ENV["INSTANCE_NAME"])
         self.assertEqual(parse_env_value(written, "SERVER_PUBLIC_IPV4"), VALID_INSTANCE_ENV["SERVER_PUBLIC_IPV4"])
         self.assertIsNone(parse_env_value(written, "CF_API_TOKEN"))
+        self.assertLess(runner.calls.index(DOCKER_VALIDATE_STANDALONE), runner.calls.index(DOCKER_PREPARE_DRY_RUN))
+        self.assertLess(runner.calls.index(DOCKER_PREPARE_APPLY), runner.calls.index(DOCKER_LAYOUT_DRY_RUN))
+        self.assertNotIn(("ufw", "allow", "80/tcp"), runner.calls)
+        self.assertNotIn(("ufw", "allow", "443/tcp"), runner.calls)
 
     def test_existing_standalone_values_are_reused_on_resume_without_reprompting(self):
         uid = str(os.getuid())
@@ -298,6 +360,8 @@ class DockerHostingStackTests(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertEqual(parse_env_value(written, "UNRELATED_KEEP"), "yes")
         self.assertEqual(runner.responses, [])
+        self.assertIn(DOCKER_PREPARE_DRY_RUN, runner.calls)
+        self.assertIn(DOCKER_PREPARE_APPLY, runner.calls)
 
     def test_website_migration_uses_migration_validator(self):
         uid = str(os.getuid())
@@ -316,6 +380,227 @@ class DockerHostingStackTests(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertIn(DOCKER_VALIDATE_MIGRATION, runner.calls)
         self.assertNotIn(DOCKER_VALIDATE_BASE, runner.calls)
+        self.assertLess(runner.calls.index(DOCKER_PREPARE_APPLY), runner.calls.index(DOCKER_LAYOUT_DRY_RUN))
+
+    def test_public_web_modes_prepare_docker_before_capability_handoff(self):
+        uid = str(os.getuid())
+        cases = [
+            ("base", DOCKER_VALIDATE_BASE, DOCKER_LAYOUT_DRY_RUN, VALID_BASE_ENV),
+            ("n8n", DOCKER_VALIDATE_N8N, DOCKER_INSTALL_N8N_DRY_RUN, VALID_N8N_ENV),
+            ("website-migration", DOCKER_VALIDATE_MIGRATION, DOCKER_LAYOUT_DRY_RUN, VALID_BASE_ENV),
+        ]
+        for mode, validate_command, handoff_command, env_values in cases:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                runner = ScriptedRunner(successful_existing_commands(uid, validate_command, handoff_command))
+                ctx = make_context(tmp, runner)
+                write_home_env(ctx)
+                write_docker_env(ctx, {**env_values, "SUDO_PASSWORD": VALID_SUDO_PASSWORD})
+                with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
+                    os.environ,
+                    {"LSM_VPS_DOCKER_MODE": mode},
+                    clear=False,
+                ):
+                    result = run_docker_hosting_stack(ctx)
+
+            self.assertEqual(result.status, "completed")
+            self.assertLess(runner.calls.index(validate_command), runner.calls.index(DOCKER_PREPARE_DRY_RUN))
+            self.assertLess(runner.calls.index(DOCKER_PREPARE_APPLY), runner.calls.index(handoff_command))
+
+    def test_docker_preparation_dry_run_failure_blocks_stage16(self):
+        uid = str(os.getuid())
+        dry_run_failure = CommandResult(list(DOCKER_PREPARE_DRY_RUN), 1, "", "Conflicting Docker package family detected:\n- docker.io\n")
+        runner = ScriptedRunner(
+            [
+                (DOCKER_CLONE, ""),
+                (DOCKER_ENSURE_ENV, ""),
+                (("id", "-u", "sadmin"), uid),
+                (DOCKER_AUDIT, ""),
+                (DOCKER_VALIDATE_STANDALONE, ""),
+                (DOCKER_PREPARE_DRY_RUN, dry_run_failure),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            write_home_env(ctx)
+            write_docker_env(ctx, {**VALID_INSTANCE_ENV, "SUDO_PASSWORD": VALID_SUDO_PASSWORD})
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
+                os.environ,
+                {"LSM_VPS_DOCKER_MODE": "standalone-app"},
+                clear=False,
+            ):
+                with self.assertRaises(Blocked) as caught:
+                    run_docker_hosting_stack(ctx)
+
+        self.assertIn("Docker package conflict", str(caught.exception))
+        self.assertNotIn(DOCKER_PREPARE_APPLY, runner.calls)
+
+    def test_docker_preparation_apply_failure_blocks_stage16(self):
+        uid = str(os.getuid())
+        apply_failure = CommandResult(list(DOCKER_PREPARE_APPLY), 1, "", "docker.service failed to start\n")
+        runner = ScriptedRunner(
+            [
+                (DOCKER_CLONE, ""),
+                (DOCKER_ENSURE_ENV, ""),
+                (("id", "-u", "sadmin"), uid),
+                (DOCKER_AUDIT, ""),
+                (DOCKER_VALIDATE_STANDALONE, ""),
+                (DOCKER_PREPARE_DRY_RUN, "Docker host preparation plan:\n"),
+                (DOCKER_PREPARE_APPLY, apply_failure),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            write_home_env(ctx)
+            write_docker_env(ctx, {**VALID_INSTANCE_ENV, "SUDO_PASSWORD": VALID_SUDO_PASSWORD})
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
+                os.environ,
+                {"LSM_VPS_DOCKER_MODE": "standalone-app"},
+                clear=False,
+            ):
+                with self.assertRaises(Blocked) as caught:
+                    run_docker_hosting_stack(ctx)
+
+        self.assertIn("Docker service failure", str(caught.exception))
+
+    def test_compose_missing_after_preparation_blocks_stage16(self):
+        uid = str(os.getuid())
+        compose_missing = CommandResult(list(DOCKER_COMPOSE_VERSION), 1, "", "docker: 'compose' is not a docker command\n")
+        runner = ScriptedRunner(
+            [
+                (DOCKER_CLONE, ""),
+                (DOCKER_ENSURE_ENV, ""),
+                (("id", "-u", "sadmin"), uid),
+                (DOCKER_AUDIT, ""),
+                (DOCKER_VALIDATE_STANDALONE, ""),
+                *docker_preparation_commands(compose_version_result=compose_missing),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            write_home_env(ctx)
+            write_docker_env(ctx, {**VALID_INSTANCE_ENV, "SUDO_PASSWORD": VALID_SUDO_PASSWORD})
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
+                os.environ,
+                {"LSM_VPS_DOCKER_MODE": "standalone-app"},
+                clear=False,
+            ):
+                with self.assertRaises(Blocked) as caught:
+                    run_docker_hosting_stack(ctx)
+
+        self.assertIn("Docker Compose plugin", str(caught.exception))
+        self.assertNotIn(DOCKER_LAYOUT_DRY_RUN, runner.calls)
+
+    def test_docker_service_inactive_after_preparation_blocks_stage16(self):
+        uid = str(os.getuid())
+        inactive = CommandResult(list(DOCKER_SERVICE_ACTIVE), 3, "inactive\n", "")
+        runner = ScriptedRunner(
+            [
+                (DOCKER_CLONE, ""),
+                (DOCKER_ENSURE_ENV, ""),
+                (("id", "-u", "sadmin"), uid),
+                (DOCKER_AUDIT, ""),
+                (DOCKER_VALIDATE_STANDALONE, ""),
+                *docker_preparation_commands(service_active_result=inactive),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            write_home_env(ctx)
+            write_docker_env(ctx, {**VALID_INSTANCE_ENV, "SUDO_PASSWORD": VALID_SUDO_PASSWORD})
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
+                os.environ,
+                {"LSM_VPS_DOCKER_MODE": "standalone-app"},
+                clear=False,
+            ):
+                with self.assertRaises(Blocked) as caught:
+                    run_docker_hosting_stack(ctx)
+
+        self.assertIn("docker.service is not active", str(caught.exception))
+
+    def test_docker_tcp_exposure_after_preparation_blocks_stage16(self):
+        uid = str(os.getuid())
+        runner = ScriptedRunner(
+            [
+                (DOCKER_CLONE, ""),
+                (DOCKER_ENSURE_ENV, ""),
+                (("id", "-u", "sadmin"), uid),
+                (DOCKER_AUDIT, ""),
+                (DOCKER_VALIDATE_STANDALONE, ""),
+                *docker_preparation_commands(tcp_listener_result="LISTEN 0 4096 0.0.0.0:2375 0.0.0.0:* users:((\"dockerd\",pid=1,fd=3))\n"),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            write_home_env(ctx)
+            write_docker_env(ctx, {**VALID_INSTANCE_ENV, "SUDO_PASSWORD": VALID_SUDO_PASSWORD})
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
+                os.environ,
+                {"LSM_VPS_DOCKER_MODE": "standalone-app"},
+                clear=False,
+            ):
+                with self.assertRaises(Blocked) as caught:
+                    run_docker_hosting_stack(ctx)
+
+        self.assertIn("Docker TCP API exposure", str(caught.exception))
+
+    def test_runtime_layout_missing_after_preparation_blocks_stage16(self):
+        uid = str(os.getuid())
+        runner = ScriptedRunner(
+            [
+                (DOCKER_CLONE, ""),
+                (DOCKER_ENSURE_ENV, ""),
+                (("id", "-u", "sadmin"), uid),
+                (DOCKER_AUDIT, ""),
+                (DOCKER_VALIDATE_STANDALONE, ""),
+                *docker_preparation_commands(),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            shutil.rmtree(ctx.layout.map("/srv/hosting"))
+            write_home_env(ctx)
+            write_docker_env(ctx, {**VALID_INSTANCE_ENV, "SUDO_PASSWORD": VALID_SUDO_PASSWORD})
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(
+                os.environ,
+                {"LSM_VPS_DOCKER_MODE": "standalone-app"},
+                clear=False,
+            ):
+                with self.assertRaises(Blocked) as caught:
+                    run_docker_hosting_stack(ctx)
+
+        self.assertIn("Docker runtime layout missing", str(caught.exception))
+
+    def test_completed_stage16_with_missing_live_docker_is_not_detected_and_can_resume(self):
+        uid = str(os.getuid())
+        with tempfile.TemporaryDirectory() as tmp:
+            detect_runner = ScriptedRunner([(DOCKER_COMMAND_EXISTS, CommandResult(list(DOCKER_COMMAND_EXISTS), 1, "", ""))])
+            ctx = make_context(tmp, detect_runner)
+            ctx.state["facts"]["docker_hosting_mode"] = "standalone-app"
+            set_stage(ctx.state, "docker_hosting_stack", "completed")
+            (ctx.layout.sadmin_home / "docker-hosting-stack" / ".git").mkdir(parents=True)
+            self.assertFalse(detect_docker_hosting_stack(ctx))
+
+            runner = ScriptedRunner(successful_existing_commands(uid, DOCKER_VALIDATE_STANDALONE, DOCKER_LAYOUT_DRY_RUN))
+            ctx.runner = runner
+            write_home_env(ctx)
+            write_docker_env(ctx, {**VALID_INSTANCE_ENV, "SUDO_PASSWORD": VALID_SUDO_PASSWORD})
+            with mock.patch("lsm_vps_init.stages.os.geteuid", return_value=0), mock.patch.dict(os.environ, {}, clear=True):
+                result = run_docker_hosting_stack(ctx)
+
+        self.assertEqual(result.status, "completed")
+        self.assertIn(DOCKER_PREPARE_APPLY, runner.calls)
+
+    def test_completed_stage16_with_valid_live_docker_detects_complete_without_preparation(self):
+        runner = ScriptedRunner(docker_preparation_commands()[2:])
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp, runner)
+            ctx.state["facts"]["docker_hosting_mode"] = "standalone-app"
+            set_stage(ctx.state, "docker_hosting_stack", "completed")
+            (ctx.layout.sadmin_home / "docker-hosting-stack" / ".git").mkdir(parents=True)
+            self.assertTrue(detect_docker_hosting_stack(ctx))
+
+        self.assertNotIn(DOCKER_PREPARE_DRY_RUN, runner.calls)
+        self.assertNotIn(DOCKER_PREPARE_APPLY, runner.calls)
 
     def test_repository_selection_persists_docker_capability_before_hardening(self):
         runner = ScriptedRunner([])
@@ -460,6 +745,7 @@ class DockerHostingStackTests(unittest.TestCase):
                 (DOCKER_CHOWN_ENV, ""),
                 (DOCKER_AUDIT, ""),
                 (DOCKER_VALIDATE_N8N, ""),
+                *docker_preparation_commands(),
                 (DOCKER_INSTALL_N8N_DRY_RUN, ""),
             ]
         )
@@ -510,10 +796,14 @@ class DockerHostingStackTests(unittest.TestCase):
         self.assertNotIn(VALID_SUDO_PASSWORD, log_payload)
         audit_index = runner.calls.index(DOCKER_AUDIT)
         validation_index = runner.calls.index(DOCKER_VALIDATE_N8N)
+        prepare_dry_run_index = runner.calls.index(DOCKER_PREPARE_DRY_RUN)
+        prepare_apply_index = runner.calls.index(DOCKER_PREPARE_APPLY)
         install_index = runner.calls.index(DOCKER_INSTALL_N8N_DRY_RUN)
         expected_redactions = [VALID_N8N_ENV["CF_API_TOKEN"], VALID_SUDO_PASSWORD]
         self.assertEqual(runner.kwargs[audit_index]["redact_values"], expected_redactions)
         self.assertEqual(runner.kwargs[validation_index]["redact_values"], expected_redactions)
+        self.assertEqual(runner.kwargs[prepare_dry_run_index]["redact_values"], expected_redactions)
+        self.assertEqual(runner.kwargs[prepare_apply_index]["redact_values"], expected_redactions)
         self.assertEqual(runner.kwargs[install_index]["redact_values"], expected_redactions)
         self.assertFalse(any("sudo -n true" in " ".join(call) or "sudo -v" in " ".join(call) for call in runner.calls))
 

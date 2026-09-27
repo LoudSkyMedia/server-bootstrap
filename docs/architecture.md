@@ -99,7 +99,7 @@ arguments.
 | 13 | `discord_relay_install` | Clone/update relay, configure `.env`, run repo-owned install/preflight/hooks/tests | Blocks on relay preflight/service failure |
 | 14 | `discord_relay_checkpoint` | Require real Discord -> relay -> Codex -> Discord round trip | Hard manual checkpoint |
 | 15 | `final_host_hardening` | Disable root/password SSH, remove `22`, configure UFW/fail2ban/unattended upgrades | Requires live revalidation of both recovery paths |
-| 16 | `docker_hosting_stack` | Clone/update hosting stack, hydrate protected repo `.env`, and hand off to selected dry-run/runbook workflows | Blocks on missing capability decisions or unsafe env boundaries |
+| 16 | `docker_hosting_stack` | Clone/update hosting stack, hydrate protected repo `.env`, delegate Docker host preparation, verify live Docker readiness, and hand off to selected dry-run workflows | Blocks on missing capability decisions, unsafe env boundaries, Docker prep failures, or incomplete live Docker readiness |
 
 ## Idempotency Model
 
@@ -142,7 +142,7 @@ Stage completion is either historical or mutable:
 | `discord_relay_install` | Mutable | Re-run relay preflight and user service health checks |
 | `discord_relay_checkpoint` | Historical proof plus mutable dependency | Keep operator round-trip proof, but recheck relay service/preflight before lock-down |
 | `final_host_hardening` | Mutable | Recheck effective SSH, UFW, fail2ban, and Docker exposure |
-| `docker_hosting_stack` | Mutable | Recheck checkout exists and run repo-owned validation/dry-runs before handoff |
+| `docker_hosting_stack` | Mutable | Recheck checkout exists, live Docker readiness is complete, and repo-owned validation/preparation/dry-runs succeeded before handoff |
 
 Supersession is lifecycle metadata, not a blanket waiver. After
 `final_host_hardening` completes, or when live system state authoritatively
@@ -327,6 +327,29 @@ completed Stage 15 before the capability was recorded, or later marked Stage 15
 blocked/failed even though SSH was already final-hardened, resume does not replay
 the temporary port-22 transition. Stage 15 records the capability when needed and
 reconciles stale managed web allows before final completion.
+
+Stage 16 delegates Docker runtime preparation to the Docker Hosting Stack rather
+than duplicating apt repository or package logic. After audit and validator
+success, bootstrap runs the accepted repository workflow first as:
+
+```bash
+scripts/prepare_docker_host.sh --dry-run
+```
+
+After explicit operator approval, it runs:
+
+```bash
+scripts/prepare_docker_host.sh --confirm --yes
+```
+
+Bootstrap then independently verifies that `docker` exists, `docker version`
+and `docker compose version` succeed, `docker.service` is enabled and active,
+Docker is not listening on TCP `2375` or `2376`, and the expected
+`/srv/hosting`, `/srv/hosting/apps`, and `/srv/hosting/secrets` layout exists.
+A stale completed Stage 16 record is not enough: if live Docker readiness is
+missing on a legacy host, `sudo lsm-vps-init resume` re-enters Stage 16 and
+reconciles through the repository-owned preparation workflow without replaying
+the SSH transition.
 
 ## Release Trust
 

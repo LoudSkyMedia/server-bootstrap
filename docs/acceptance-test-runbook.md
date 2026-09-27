@@ -930,10 +930,9 @@ Expected result:
 
 STOP if port `65500` fails after reboot or if SSH hardening regresses.
 
-## 23. Docker Hosting Stack Dry-Run Handoff
+## 23. Docker Hosting Stack Runtime Preparation And Dry-Run Handoff
 
-Run the Docker Hosting Stack module only in dry-run/validation mode. If the
-wizard already selected this module, resume the final stage:
+If the wizard selected the Docker Hosting Stack module, resume the final stage:
 
 ```bash
 sudo lsm-vps-init resume
@@ -944,13 +943,28 @@ reused here. Valid server-bootstrap capability names are `base`,
 `standalone-app`, `n8n`, and `website-migration`; `website-migration` maps to
 Docker validator mode `migration`.
 
-Verify the checkout and dry-run evidence:
+Stage 16 delegates Docker runtime preparation to the Docker Hosting Stack's
+canonical command. The wizard must show the dry-run plan, ask for approval, run
+the confirmed repository workflow, and then verify live Docker state before the
+capability dry-run handoff is complete:
+
+```bash
+sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && scripts/prepare_docker_host.sh --dry-run'
+sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && scripts/prepare_docker_host.sh --confirm --yes'
+```
+
+Verify the checkout, Docker readiness, and dry-run evidence:
 
 ```bash
 sudo -iu sadmin test -d /home/sadmin/docker-hosting-stack/.git
 sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && git status --short'
-sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && scripts/validate_env.sh --mode base'
-sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && scripts/bootstrap_layout.sh --dry-run'
+sudo docker version
+sudo docker compose version
+systemctl is-enabled docker
+systemctl is-active docker
+sudo ss -H -ltnp | grep -E ':(2375|2376)\b' && echo 'Docker TCP exposure: FAIL' || echo 'Docker TCP exposure absent: PASS'
+sudo test -d /srv/hosting/apps
+sudo test -d /srv/hosting/secrets
 ```
 
 For a `standalone-app` rehearsal, validate the standalone contract and confirm
@@ -958,6 +972,7 @@ that final UFW rules do not automatically allow public HTTP/HTTPS:
 
 ```bash
 sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && scripts/validate_env.sh --mode standalone-app'
+sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && scripts/bootstrap_layout.sh --dry-run'
 sudo ufw status verbose
 ```
 
@@ -972,15 +987,30 @@ For `website-migration`, validate with the Docker stack's migration mode:
 
 ```bash
 sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && scripts/validate_env.sh --mode migration'
+sudo -iu sadmin bash -lc 'cd /home/sadmin/docker-hosting-stack && scripts/bootstrap_layout.sh --dry-run'
 ```
 
-Expected result: the private repo is accessible, validation is explicit, and
-only dry-run commands are used. No Docker service or application port is exposed
-unless the selected repo workflow explicitly requires it and the operator has
-approved that separate action.
+Expected result: the private repo is accessible, validation is explicit, Docker
+Engine and Compose are ready through the local Unix socket, Docker is not
+exposed on TCP `2375` or `2376`, and the selected capability dry-run succeeds.
+No application port is exposed unless the selected repo workflow explicitly
+requires it and the operator has approved that separate action.
 
-STOP if any command attempts a non-dry-run install, exposes unexpected ports, or
-requires unresolved `.env` values. Do not improvise a parallel installer.
+For a legacy host that was previously marked complete before Docker was ready,
+install the current stable bootstrap and rerun:
+
+```bash
+sudo lsm-vps-init resume
+```
+
+The host should re-enter Stage 16, prepare/repair Docker through the Docker
+Hosting Stack workflow, and must not replay `ssh_dual_port`, `firewall_phase_a`,
+or any command that reopens port `22`.
+
+STOP if Docker preparation fails, Docker Compose remains missing, docker.service
+is not enabled/active after preparation, TCP `2375`/`2376` is exposed, runtime
+layout directories are missing, unexpected ports are exposed, or unresolved
+`.env` values remain. Do not improvise a parallel installer.
 
 ## 24. Secret And Log Safety Review
 

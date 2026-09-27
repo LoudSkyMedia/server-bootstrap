@@ -43,6 +43,12 @@ VPS.
 - [ ] Docker Hosting Stack module selected for dry-run handoff.
 - [ ] Docker Hosting Stack capability selected before final host hardening.
 - [ ] Docker Hosting Stack capability persisted in state without secrets.
+- [ ] Docker Hosting Stack host preparation dry-run was shown before mutation.
+- [ ] Docker Hosting Stack Docker preparation ran through `scripts/prepare_docker_host.sh --confirm --yes`.
+- [ ] `docker version` succeeds.
+- [ ] `docker compose version` succeeds.
+- [ ] `docker.service` is enabled and active.
+- [ ] `/srv/hosting/apps` and `/srv/hosting/secrets` exist after preparation.
 - [ ] Relay repository cloned to `/home/sadmin/codex-vps-discord-relay`.
 - [ ] Relay `.env` is `sadmin:sadmin` mode `600`.
 - [ ] Relay `.env` does not contain the sudo-password key.

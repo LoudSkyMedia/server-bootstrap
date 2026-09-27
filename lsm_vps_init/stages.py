@@ -45,6 +45,13 @@ DISCORD_ID_PATTERN = re.compile(r"^[0-9]{17,20}$")
 CODEX_WORK_ROOT = "/home/sadmin"
 SSHD_SADMIN_MATCH_CRITERIA = f"user=sadmin,host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport={SSH_PORT}"
 DOCKER_HOSTING_REPO = "/home/sadmin/docker-hosting-stack"
+DOCKER_HOST_PREPARE_DRY_RUN_COMMAND = "scripts/prepare_docker_host.sh --dry-run"
+DOCKER_HOST_PREPARE_APPLY_COMMAND = "scripts/prepare_docker_host.sh --confirm --yes"
+DOCKER_RUNTIME_LAYOUT_DIRS = (
+    "/srv/hosting",
+    "/srv/hosting/apps",
+    "/srv/hosting/secrets",
+)
 DOCKER_HOSTING_VALIDATOR_MODES = {
     "base": "base",
     "standalone-app": "standalone-app",
@@ -2414,7 +2421,15 @@ def detect_docker_hosting_stack(ctx: Context) -> bool:
         return detected_stage_by_state(ctx, "docker_hosting_stack")
     if not detected_stage_by_state(ctx, "docker_hosting_stack"):
         return False
-    return Path(DOCKER_HOSTING_REPO, ".git").exists()
+    if not (ctx.layout.sadmin_home / "docker-hosting-stack" / ".git").exists():
+        return False
+    try:
+        if selected_docker_hosting_mode(ctx) is None:
+            return False
+    except Blocked:
+        return False
+    issues, _evidence = docker_readiness_issues(ctx)
+    return not issues
 
 
 def protected_sadmin_env_file_trust_error(
@@ -2709,6 +2724,138 @@ def docker_hosting_validation_failure_message(mode: str, validation: CommandResu
     return "Docker Hosting Stack .env validation failed. Review the repo validator output, fix configuration, then resume with `sudo lsm-vps-init resume`."
 
 
+def docker_host_preparation_failure_message(result: CommandResult, *, dry_run: bool) -> str:
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    phase = "dry-run" if dry_run else "execution"
+    if "conflicting docker package" in output or "remove conflicting docker packages" in output or "snap:docker" in output:
+        return (
+            "Docker package conflict detected during Docker Hosting Stack host preparation. "
+            "Remove conflicting Docker package families only during a reviewed maintenance window, then resume with `sudo lsm-vps-init resume`."
+        )
+    if "docker.service" in output and any(marker in output for marker in ("failed", "inactive", "could not", "not active")):
+        return (
+            "Docker service failure during Docker Hosting Stack host preparation. "
+            "Review `systemctl status docker` and the Docker Hosting Stack preparation output, then resume."
+        )
+    if "docker compose" in output and any(marker in output for marker in ("not found", "missing", "failed")):
+        return (
+            "Docker Compose plugin missing or unusable during Docker Hosting Stack host preparation. "
+            "Review the Docker package installation output, then resume."
+        )
+    if "runtime layout" in output or "bootstrap_layout" in output or "/srv/hosting" in output:
+        return (
+            "Docker runtime-layout preparation failed. "
+            "Review `/srv/hosting` permissions and the Docker Hosting Stack preparation output, then resume."
+        )
+    return (
+        f"Docker Hosting Stack Docker host preparation {phase} failed. "
+        "Review the preparation output and resume with `sudo lsm-vps-init resume`."
+    )
+
+
+def docker_readiness_issues(ctx: Context) -> tuple[list[str], dict[str, Any]]:
+    issues: list[str] = []
+    evidence: dict[str, Any] = {}
+
+    command_result = ctx.runner.run(["bash", "-lc", "command -v docker >/dev/null"], check=False)
+    docker_command = command_result.returncode == 0
+    evidence["docker_command"] = docker_command
+    if not docker_command:
+        issues.append("Docker command is not available")
+        return issues, evidence
+
+    version = ctx.runner.run(["docker", "version"], check=False)
+    if version.returncode != 0:
+        issues.append("Docker Engine is not responding to `docker version`")
+    else:
+        evidence["docker_version"] = first_nonempty_line(version.stdout)
+
+    compose = ctx.runner.run(["docker", "compose", "version"], check=False)
+    if compose.returncode != 0:
+        issues.append("Docker Compose plugin missing or `docker compose version` failed")
+    else:
+        evidence["compose_version"] = first_nonempty_line(compose.stdout)
+
+    enabled = ctx.runner.run(["systemctl", "is-enabled", "docker"], check=False)
+    enabled_text = enabled.stdout.strip()
+    evidence["docker_service_enabled"] = enabled.returncode == 0 and enabled_text == "enabled"
+    if not evidence["docker_service_enabled"]:
+        issues.append("docker.service is not enabled")
+
+    active = ctx.runner.run(["systemctl", "is-active", "docker"], check=False)
+    active_text = active.stdout.strip()
+    evidence["docker_service_active"] = active.returncode == 0 and active_text == "active"
+    if not evidence["docker_service_active"]:
+        issues.append("docker.service is not active")
+
+    listeners = ctx.runner.run(["ss", "-H", "-ltnp"], check=False)
+    if listeners.returncode != 0:
+        issues.append("Docker TCP listener inspection failed")
+    elif re.search(r":(?:2375|2376)\b", listeners.stdout):
+        evidence["docker_tcp_exposed"] = True
+        issues.append("Docker TCP API exposure detected on port 2375/2376")
+    else:
+        evidence["docker_tcp_exposed"] = False
+
+    missing_layout = [path for path in DOCKER_RUNTIME_LAYOUT_DIRS if not ctx.layout.map(path).is_dir()]
+    evidence["runtime_layout_ready"] = not missing_layout
+    if missing_layout:
+        issues.append("Docker runtime layout missing: " + ", ".join(missing_layout))
+
+    return issues, evidence
+
+
+def first_nonempty_line(text: str, *, limit: int = 200) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:limit]
+    return ""
+
+
+def require_docker_readiness(ctx: Context) -> dict[str, Any]:
+    issues, evidence = docker_readiness_issues(ctx)
+    if issues:
+        raise Blocked("Docker host readiness validation failed: " + "; ".join(issues))
+    return evidence
+
+
+def print_docker_prepare_dry_run(result: CommandResult) -> None:
+    output = "\n".join(part.rstrip() for part in (result.stdout, result.stderr) if part.strip())
+    if output:
+        print()
+        print("Docker Hosting Stack host preparation dry-run output:")
+        print(output)
+
+
+def run_docker_host_preparation(ctx: Context, redactions: list[str]) -> dict[str, Any]:
+    dry_run = ctx.sadmin_shell(
+        f"cd /home/sadmin/docker-hosting-stack && {DOCKER_HOST_PREPARE_DRY_RUN_COMMAND}",
+        check=False,
+        timeout=900,
+        redact_values=redactions,
+    )
+    if dry_run.returncode != 0:
+        raise Blocked(docker_host_preparation_failure_message(dry_run, dry_run=True))
+    print_docker_prepare_dry_run(dry_run)
+    prompt = (
+        "Proceed with Docker Hosting Stack Docker host preparation now? "
+        "This delegates Docker Engine/Compose and /srv/hosting layout preparation to "
+        f"`{DOCKER_HOST_PREPARE_APPLY_COMMAND}`."
+    )
+    if not ctx.confirm(prompt, default=False):
+        raise Blocked("Docker Hosting Stack Docker host preparation requires explicit operator confirmation.")
+    apply = ctx.sadmin_shell(
+        f"cd /home/sadmin/docker-hosting-stack && {DOCKER_HOST_PREPARE_APPLY_COMMAND}",
+        check=False,
+        timeout=1800,
+        redact_values=redactions,
+    )
+    if apply.returncode != 0:
+        raise Blocked(docker_host_preparation_failure_message(apply, dry_run=False))
+    return require_docker_readiness(ctx)
+
+
 def run_docker_hosting_stack(ctx: Context) -> StageResult:
     if not ctx.state.get("selected_modules", {}).get(DOCKER_MODULE):
         return StageResult("completed", "Docker hosting stack module was not selected.")
@@ -2746,11 +2893,16 @@ def run_docker_hosting_stack(ctx: Context) -> StageResult:
     )
     if validation.returncode != 0:
         raise Blocked(docker_hosting_validation_failure_message(mode, validation))
+    readiness = run_docker_host_preparation(ctx, redactions)
     if mode == "n8n":
         ctx.sadmin_shell("cd /home/sadmin/docker-hosting-stack && scripts/install_n8n.sh --dry-run", timeout=180, redact_values=redactions)
     else:
         ctx.sadmin_shell("cd /home/sadmin/docker-hosting-stack && scripts/bootstrap_layout.sh --dry-run", timeout=180, redact_values=redactions)
-    return StageResult("completed", f"Docker Hosting Stack handoff dry-run completed for mode: {mode}.", {"docker_hosting_mode": mode, "validator_mode": validation_mode})
+    return StageResult(
+        "completed",
+        f"Docker Hosting Stack handoff dry-run completed for mode: {mode}.",
+        {"docker_hosting_mode": mode, "validator_mode": validation_mode, **readiness},
+    )
 
 
 STAGES: list[StageDefinition] = [

@@ -344,6 +344,20 @@ If a stage is blocked, stop at that checkpoint, fix the specific prerequisite
 shown in `status`, and rerun `resume`. Use the provider console for recovery if
 SSH access is broken.
 
+Legacy hosts that previously reached bootstrap-complete with the Docker Hosting
+Stack selected but without a working Docker runtime can be repaired by installing
+the current `stable` bootstrap and running:
+
+```bash
+sudo lsm-vps-init resume
+```
+
+Stage 16 will re-enter if live Docker readiness is missing, delegate Docker
+Engine/Compose and `/srv/hosting` preparation to the Docker Hosting Stack's
+canonical `scripts/prepare_docker_host.sh` workflow, and keep the final SSH
+hardening posture intact. It must not replay the temporary port-`22` SSH/UFW
+transition.
+
 ## Secrets Policy
 
 The bootstrap never logs or stores in state:
@@ -383,12 +397,14 @@ Initial module contracts:
   its own preflight, service installer, hook installer, tests, and systemd user
   service.
 - `docker-hosting-stack`: clones `LoudSkyMedia/docker-hosting-stack` to
-  `/home/sadmin/docker-hosting-stack`, starts with the repository's audit,
-  validation, and dry-run workflows, then follows its runbooks for selected
-  hosting capabilities such as base hosting, standalone apps, n8n, or website
-  migration. The selected capability is recorded before final host hardening;
-  Stage 16 reuses it, validates the matching Docker stack mode, and remains
-  resumable after `.env` correction.
+  `/home/sadmin/docker-hosting-stack`, starts with the repository's audit and
+  environment validator, then delegates Docker Engine/Compose and `/srv/hosting`
+  runtime-layout preparation to the stack's canonical
+  `scripts/prepare_docker_host.sh --dry-run` and
+  `scripts/prepare_docker_host.sh --confirm --yes` workflow. The selected
+  capability is recorded before final host hardening; Stage 16 reuses it,
+  validates the matching Docker stack mode, independently verifies live Docker
+  readiness, and remains resumable after `.env` or Docker readiness correction.
 
 The Discord relay is outbound-only and should not open an inbound public port.
 Docker hosting ingress ports are derived from selected capabilities, not from a
